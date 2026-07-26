@@ -56,35 +56,36 @@ Advertised subnets require route grants as groups, for example
 
 Produces public `mynode-cert.toml` and private `mynode-key.toml`.
 
-### Verify
-
-```sh
-liteway-cert verify -c mynode-cert.toml --ca-cert ca.toml
-```
-
-### Generate Lighthouse Config Entry
-
-```sh
-liteway-cert gen-lighthouse -c mynode-cert.toml -a 1.2.3.4:5678
-```
-
-Prints a TOML `[[lighthouses]]` block.
-
-## 2. Node Configuration (`liteway.toml`)
+## 2. Public Node Configuration (`liteway.toml`)
 
 ```toml
-# keep following line is needed only for lighthouse or relay setup
 listen = "0.0.0.0:12345"
 network_secret = "<hex from gen-ca>"
 ca_cert_path = "ca.toml"
 node_cert_path = "mynode-cert.toml"
 node_key_path = "mynode-key.toml"
-punch_interval_secs = 10
-keepalive_punch = true
-keepalive_timeout_secs = 30
-relay_fallback_timeout_secs = 5
-am_lighthouse = false
-am_relay = false
+am_lighthouse = true
+am_relay = true
+
+[interface]
+name = "liteway0"
+mtu = 1300
+```
+
+When `am_lighthouse = true`, the node acts as a peer discovery registry. Nodes that
+handshake with it are registered by their certificate IP/subnets and UDP endpoint.
+If another node has no route for a VPN IP, it asks connected lighthouses for the
+peer behind that IP and then starts a direct handshake to the returned endpoint.
+Lighthouse certificates are verified against the configured CA during the normal
+handshake; `[[lighthouses]]` only pins the underlay address to contact.
+
+## 3. Private Node Configuration (`liteway.toml`)
+
+```toml
+network_secret = "<hex from gen-ca>"
+ca_cert_path = "ca.toml"
+node_cert_path = "mynode-cert.toml"
+node_key_path = "mynode-key.toml"
 
 [interface]
 name = "liteway0"
@@ -95,14 +96,7 @@ name = "lh1"
 address = "1.2.3.4:5678"
 ```
 
-When `am_lighthouse = true`, the node acts as a peer discovery registry. Nodes that
-handshake with it are registered by their certificate IP/subnets and UDP endpoint.
-If another node has no route for a VPN IP, it asks connected lighthouses for the
-peer behind that IP and then starts a direct handshake to the returned endpoint.
-Lighthouse certificates are verified against the configured CA during the normal
-handshake; `[[lighthouses]]` only pins the underlay address to contact.
-
-## 3. Daemon (`litewayd`)
+## 4. Daemon (`litewayd`)
 
 ```sh
 # Linux (capability, no root needed)
@@ -116,7 +110,7 @@ sudo litewayd -c liteway.toml
 litewayd -c liteway.toml
 ```
 
-## 4. Docker compose
+## 5. Docker compose
 
 Add this to config:
 
@@ -143,6 +137,31 @@ services:
       - ./ca.toml:/ca.toml
       - ./mynode-cert.toml:/cert.toml
       - ./mynode-key.toml:/key.toml
+```
+
+## 6. Full config
+
+```yaml
+# keep following line is needed only for lighthouse or relay setup
+listen = "0.0.0.0:12345"
+network_secret = "<hex from gen-ca>"
+ca_cert_path = "ca.toml"
+node_cert_path = "mynode-cert.toml"
+node_key_path = "mynode-key.toml"
+punch_interval_secs = 10
+keepalive_punch = true
+keepalive_timeout_secs = 30
+relay_fallback_timeout_secs = 5
+am_lighthouse = false
+am_relay = false
+
+[interface]
+name = "liteway0"
+mtu = 1300
+
+[[lighthouses]]
+name = "lh1"
+address = "1.2.3.4:5678"
 ```
 
 ## License
