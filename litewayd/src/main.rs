@@ -46,6 +46,25 @@ enum AddPeerOutcome {
     KeptExisting,
 }
 
+fn accept_handshake_session(
+    our_id: u32,
+    peer_id: u32,
+    existing_initiator_id: Option<u32>,
+    initiator_id: u32,
+    simultaneous: bool,
+) -> bool {
+    if !simultaneous {
+        return true;
+    }
+
+    let preferred_initiator = our_id.min(peer_id);
+    if initiator_id != preferred_initiator {
+        return false;
+    }
+
+    existing_initiator_id != Some(preferred_initiator)
+}
+
 struct RouteTable {
     routes: Vec<(IpNetwork, u32)>,
 }
@@ -493,44 +512,37 @@ fn main() -> anyhow::Result<()> {
             let mut added = false;
             let now = unix_now_secs();
             if let Ok(mut p) = peers_add.lock() {
-                if let Some(existing) = p.get(&id) {
-                    let preferred_initiator = our_id.min(id);
-                    if simultaneous && initiator_id != preferred_initiator {
+                let existing_initiator = p.get(&id).map(|peer| peer.handshake_initiator_id);
+                if !accept_handshake_session(
+                    our_id,
+                    id,
+                    existing_initiator,
+                    initiator_id,
+                    simultaneous,
+                ) {
+                    if simultaneous {
                         log::debug!(
                             "ignoring simultaneous handshake with {} ({}) initiated by {}; preferred initiator is {}",
                             cert.body.meta.name,
                             id,
                             initiator_id,
-                            preferred_initiator
-                        );
-                        tx_key.zeroize();
-                        rx_key.zeroize();
-                        return AddPeerOutcome::KeptExisting;
-                    }
-                    if simultaneous
-                        && existing.handshake_initiator_id != preferred_initiator
-                        && initiator_id == preferred_initiator
-                    {
-                        log::debug!(
-                            "replacing simultaneous handshake with {} ({}) using preferred initiator {}",
-                            cert.body.meta.name,
-                            id,
-                            initiator_id
+                            our_id.min(id)
                         );
                     }
-                } else {
-                    let preferred_initiator = our_id.min(id);
-                    if simultaneous && initiator_id != preferred_initiator {
-                        log::debug!(
-                            "waiting for preferred simultaneous handshake with {} ({}); ignoring session initiated by {}",
-                            cert.body.meta.name,
-                            id,
-                            initiator_id
-                        );
-                        tx_key.zeroize();
-                        rx_key.zeroize();
-                        return AddPeerOutcome::KeptExisting;
-                    }
+                    tx_key.zeroize();
+                    rx_key.zeroize();
+                    return AddPeerOutcome::KeptExisting;
+                }
+                if simultaneous
+                    && existing_initiator.is_some_and(|existing| existing != our_id.min(id))
+                    && initiator_id == our_id.min(id)
+                {
+                    log::debug!(
+                        "replacing simultaneous handshake with {} ({}) using preferred initiator {}",
+                        cert.body.meta.name,
+                        id,
+                        initiator_id
+                    );
                 }
 
                 old_rx_session_id = p
@@ -1943,5 +1955,92 @@ impl ReplayWindow {
         }
         self.seen |= bit;
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn simultaneous_handshake_prefers_lower_node_id() {
+        let low_id = 10;
+        let high_id = 20;
+
+        assert!(accept_handshake_session(
+            low_id, high_id, None, low_id, true
+        ));
+        assert!(accept_handshake_session(
+            high_id, low_id, None, low_id, true
+        ));
+        assert!(!accept_handshake_session(
+            low_id, high_id, None, high_id, true
+        ));
+        assert!(!accept_handshake_session(
+            high_id, low_id, None, high_id, true
+        ));
+    }
+
+    #[test]
+    fn simultaneous_handshake_keeps_existing_preferred_session() {
+        let low_id = 10;
+        let high_id = 20;
+
+        assert!(!accept_handshake_session(
+            low_id,
+            high_id,
+            Some(low_id),
+            low_id,
+            true
+        ));
+        assert!(!accept_handshake_session(
+            low_id,
+            high_id,
+            Some(low_id),
+            high_id,
+            true
+        ));
+    }
+
+    #[test]
+    fn simultaneous_handshake_replaces_existing_non_preferred_session() {
+        let low_id = 10;
+        let high_id = 20;
+
+        assert!(accept_handshake_session(
+            low_id,
+            high_id,
+            Some(high_id),
+            low_id,
+            true
+        ));
+        assert!(accept_handshake_session(
+            high_id,
+            low_id,
+            Some(high_id),
+            low_id,
+            true
+        ));
+    }
+
+    #[test]
+    fn non_simultaneous_handshake_allows_reconnect_from_either_side() {
+        let low_id = 10;
+        let high_id = 20;
+
+        assert!(accept_handshake_session(
+            low_id,
+            high_id,
+            Some(low_id),
+            high_id,
+            false
+        ));
+        assert!(accept_handshake_session(
+            high_id,
+            low_id,
+            Some(high_id),
+            low_id,
+            false
+        ));
     }
 }
