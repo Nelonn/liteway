@@ -208,8 +208,7 @@ fn main() -> anyhow::Result<()> {
     log::debug!("fragment UDP payload limit set to {} bytes", max_datagram);
 
     let peers: Arc<Mutex<HashMap<u32, PeerState>>> = Arc::new(Mutex::new(HashMap::new()));
-    let pending: Arc<Mutex<HashMap<u32, PendingHandshake>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let pending: Arc<Mutex<HashMap<u32, PendingHandshake>>> = Arc::new(Mutex::new(HashMap::new()));
     let route_map: Arc<Mutex<RouteTable>> = Arc::new(Mutex::new(RouteTable::new()));
     let established: Arc<Mutex<HashSet<SocketAddr>>> = Arc::new(Mutex::new(HashSet::new()));
     let rx_sessions: Arc<Mutex<HashMap<u32, u32>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -318,7 +317,12 @@ fn main() -> anyhow::Result<()> {
                         {
                             return None;
                         }
-                        Some((*session_id, peer_id, p.peer_name.clone(), p.initiate.msg.clone()))
+                        Some((
+                            *session_id,
+                            peer_id,
+                            p.peer_name.clone(),
+                            p.initiate.msg.clone(),
+                        ))
                     })
                     .collect::<Vec<_>>()
             } else {
@@ -538,7 +542,7 @@ fn main() -> anyhow::Result<()> {
             match sock_recv.recv_from(&mut recv_buf) {
                 Ok((len, src)) => {
                     let data = &recv_buf[..len];
-                    log::debug!("recv {} bytes from {}", len, src);
+                    log::trace!("recv {} bytes from {}", len, src);
                     if data.is_empty() {
                         continue;
                     }
@@ -561,7 +565,9 @@ fn main() -> anyhow::Result<()> {
                                         );
                                     } else {
                                         log::trace!(
-                                            "relayed packet to {} ({}) via masked header",
+                                            "sent {} bytes to {} (relay to {} ({}) via masked header)",
+                                            data.len(),
+                                            addr,
                                             name,
                                             header.dst_peer_id
                                         );
@@ -709,6 +715,14 @@ fn main() -> anyhow::Result<()> {
                                                 name,
                                                 header.dst_peer_id,
                                                 e
+                                            );
+                                        } else {
+                                            log::trace!(
+                                                "sent {} bytes to {} (relay to {} ({}) via masked header)",
+                                                packet.len(),
+                                                addr,
+                                                name,
+                                                header.dst_peer_id
                                             );
                                         }
                                     } else {
@@ -1175,6 +1189,13 @@ fn main() -> anyhow::Result<()> {
                                                         next_peer_id,
                                                         e
                                                     );
+                                                } else {
+                                                    log::trace!(
+                                                        "sent {} bytes to {} (relay-forward to {})",
+                                                        inner_packet.len(),
+                                                        peer.addr,
+                                                        next_peer_id
+                                                    );
                                                 }
                                             }
                                         }
@@ -1323,6 +1344,15 @@ fn main() -> anyhow::Result<()> {
                     let serialized = packet::serialize_packet(&pkt);
                     if let Err(e) = sock.send_to(&serialized, peer.addr) {
                         log::warn!("send_to {} failed: {}", peer_id, e);
+                    } else {
+                        log::trace!(
+                            "sent {} bytes to {} (data to {} ({}) for {})",
+                            serialized.len(),
+                            peer.addr,
+                            peer.name,
+                            peer_id,
+                            dst_ip
+                        );
                     }
                 }
                 Ok(_) => {} // zero-length read, ignore
@@ -1366,7 +1396,14 @@ fn main() -> anyhow::Result<()> {
             &target.tx_key,
         );
         let wire = packet::serialize_packet(&pkt);
-        let _ = sock.send_to(&wire, target.addr);
+        if let Ok(sent) = sock.send_to(&wire, target.addr) {
+            log::trace!(
+                "sent {} bytes to {} (disconnect to {})",
+                sent,
+                target.addr,
+                target.peer_id
+            );
+        }
     }
     thread::sleep(Duration::from_millis(100));
 

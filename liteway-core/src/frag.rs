@@ -75,7 +75,13 @@ pub fn send_fragmented_to_peer(
         plain.push(0);
         plain.push(1);
         let packet = handshake::seal_handshake_to_peer(network_key, &plain, dst_peer_id);
-        sock.send_to(&packet, addr)?;
+        let sent = sock.send_to(&packet, addr)?;
+        log::trace!(
+            "sent {} bytes to {} (fragment 1/1, dst_peer_id {})",
+            sent,
+            addr,
+            dst_peer_id
+        );
         return Ok(());
     }
 
@@ -88,7 +94,15 @@ pub fn send_fragmented_to_peer(
         plain.extend_from_slice(chunk);
 
         let packet = handshake::seal_handshake_to_peer(network_key, &plain, dst_peer_id);
-        sock.send_to(&packet, addr)?;
+        let sent = sock.send_to(&packet, addr)?;
+        log::trace!(
+            "sent {} bytes to {} (fragment {}/{}, dst_peer_id {})",
+            sent,
+            addr,
+            i + 1,
+            total,
+            dst_peer_id
+        );
     }
 
     Ok(())
