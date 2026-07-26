@@ -206,10 +206,6 @@ pub fn process_handshake_2(
     })
 }
 
-pub(crate) fn seal_handshake(network_key: &[u8; K_HEADER_LEN], plaintext: &[u8]) -> Vec<u8> {
-    seal_handshake_to_peer(network_key, plaintext, 0)
-}
-
 pub(crate) fn seal_handshake_to_peer(
     network_key: &[u8; K_HEADER_LEN],
     plaintext: &[u8],
