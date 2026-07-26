@@ -607,6 +607,27 @@ network_secret = "{}"
 }
 
 #[test]
+fn app_config_lighthouse_address_accepts_domain() {
+    let cfg: AppConfig = toml::from_str(&format!(
+        r#"
+ca_cert_path = "ca.toml"
+node_cert_path = "node-cert.toml"
+node_key_path = "node-key.toml"
+network_secret = "{}"
+
+[[lighthouses]]
+name = "lh-domain"
+address = "lh.example.test:4242"
+"#,
+        "22".repeat(32)
+    ))
+    .unwrap();
+
+    assert_eq!(cfg.lighthouses[0].name, "lh-domain");
+    assert_eq!(cfg.lighthouses[0].address, "lh.example.test:4242");
+}
+
+#[test]
 fn config_network_secret_invalid_fails() {
     assert!(app_config_with_secret("not-hex").network_secret().is_err());
     assert!(app_config_with_secret("").network_secret().is_err());

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LighthouseConfig {
     pub name: String,
-    pub address: SocketAddr,
+    pub address: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
