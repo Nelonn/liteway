@@ -63,6 +63,9 @@ pub struct AppConfig {
 
     #[serde(default = "default_keepalive_timeout")]
     pub keepalive_timeout_secs: u64,
+
+    #[serde(default = "default_relay_fallback_timeout")]
+    pub relay_fallback_timeout_secs: u64,
 }
 
 fn default_punch_interval() -> u64 {
@@ -75,6 +78,10 @@ fn default_keepalive_punch() -> bool {
 
 fn default_keepalive_timeout() -> u64 {
     30
+}
+
+fn default_relay_fallback_timeout() -> u64 {
+    5
 }
 
 impl AppConfig {

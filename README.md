@@ -92,6 +92,7 @@ node_key_path = "mynode-key.toml"
 punch_interval_secs = 10
 keepalive_punch = true
 keepalive_timeout_secs = 30
+relay_fallback_timeout_secs = 5
 am_lighthouse = false
 am_relay = false
 

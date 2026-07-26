@@ -40,6 +40,17 @@ pub fn send_fragmented(
     network_key: &[u8; K_HEADER_LEN],
     max_datagram: usize,
 ) -> io::Result<()> {
+    send_fragmented_to_peer(sock, data, addr, network_key, max_datagram, 0)
+}
+
+pub fn send_fragmented_to_peer(
+    sock: &UdpSocket,
+    data: &[u8],
+    addr: SocketAddr,
+    network_key: &[u8; K_HEADER_LEN],
+    max_datagram: usize,
+    dst_peer_id: u32,
+) -> io::Result<()> {
     if max_datagram < MIN_DATAGRAM {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -63,7 +74,7 @@ pub fn send_fragmented(
         plain.extend_from_slice(&msg_id.to_be_bytes());
         plain.push(0);
         plain.push(1);
-        let packet = handshake::seal_handshake(network_key, &plain);
+        let packet = handshake::seal_handshake_to_peer(network_key, &plain, dst_peer_id);
         sock.send_to(&packet, addr)?;
         return Ok(());
     }
@@ -76,7 +87,7 @@ pub fn send_fragmented(
         plain.push(total as u8);
         plain.extend_from_slice(chunk);
 
-        let packet = handshake::seal_handshake(network_key, &plain);
+        let packet = handshake::seal_handshake_to_peer(network_key, &plain, dst_peer_id);
         sock.send_to(&packet, addr)?;
     }
 

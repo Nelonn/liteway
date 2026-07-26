@@ -31,6 +31,15 @@ struct KeepalivePending {
     sent_at: u64,
 }
 
+struct PendingHandshake {
+    initiate: handshake::HandshakeInitiate,
+    addr: SocketAddr,
+    peer_id: Option<u32>,
+    peer_name: String,
+    sent_at: u64,
+    relay_attempted: bool,
+}
+
 struct RouteTable {
     routes: Vec<(IpNetwork, u32)>,
 }
@@ -199,7 +208,7 @@ fn main() -> anyhow::Result<()> {
     log::debug!("fragment UDP payload limit set to {} bytes", max_datagram);
 
     let peers: Arc<Mutex<HashMap<u32, PeerState>>> = Arc::new(Mutex::new(HashMap::new()));
-    let pending: Arc<Mutex<HashMap<SocketAddr, handshake::HandshakeInitiate>>> =
+    let pending: Arc<Mutex<HashMap<u32, PendingHandshake>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let route_map: Arc<Mutex<RouteTable>> = Arc::new(Mutex::new(RouteTable::new()));
     let established: Arc<Mutex<HashSet<SocketAddr>>> = Arc::new(Mutex::new(HashSet::new()));
@@ -266,13 +275,130 @@ fn main() -> anyhow::Result<()> {
                 log::info!("punched to lighthouse {}", lh.name);
 
                 if let Ok(mut pend) = pending_punch.lock() {
-                    pend.insert(lh.address, init);
+                    pend.insert(
+                        init.my_rx_session_id,
+                        PendingHandshake {
+                            initiate: init,
+                            addr: lh.address,
+                            peer_id: None,
+                            peer_name: lh.name.clone(),
+                            sent_at: unix_now_secs(),
+                            relay_attempted: false,
+                        },
+                    );
                 }
             }
             if lighthouses.is_empty() {
                 break;
             }
             thread::sleep(Duration::from_secs(cfg_punch.punch_interval_secs));
+        }
+    });
+
+    // === Relay fallback thread ===
+    let pending_fallback = pending.clone();
+    let peers_fallback = peers.clone();
+    let sock_fallback = sock.try_clone()?;
+    let nw_key_fallback = network_key;
+    let max_datagram_fallback = max_datagram;
+    let relay_fallback_timeout_secs = config.relay_fallback_timeout_secs;
+    let running_fallback = running.clone();
+    thread::spawn(move || {
+        while running_fallback.load(Ordering::SeqCst) {
+            let now = unix_now_secs();
+            let candidates = if let Ok(mut pending) = pending_fallback.lock() {
+                let cleanup_after = relay_fallback_timeout_secs.saturating_mul(6).max(60);
+                pending.retain(|_, p| now.saturating_sub(p.sent_at) <= cleanup_after);
+                pending
+                    .iter()
+                    .filter_map(|(session_id, p)| {
+                        let peer_id = p.peer_id?;
+                        if p.relay_attempted
+                            || now.saturating_sub(p.sent_at) < relay_fallback_timeout_secs
+                        {
+                            return None;
+                        }
+                        Some((*session_id, peer_id, p.peer_name.clone(), p.initiate.msg.clone()))
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+
+            for (session_id, target_peer_id, target_name, msg) in candidates {
+                let relay = if let Ok(peers) = peers_fallback.lock() {
+                    if peers.contains_key(&target_peer_id) {
+                        continue;
+                    }
+                    peers
+                        .iter()
+                        .find(|(id, peer)| peer.is_relay && **id != target_peer_id)
+                        .map(|(id, peer)| (*id, peer.name.clone(), peer.addr))
+                } else {
+                    None
+                };
+
+                let Some((relay_id, relay_name, relay_addr)) = relay else {
+                    log::debug!(
+                        "relay fallback for {} ({}) delayed: no connected relay",
+                        target_name,
+                        target_peer_id
+                    );
+                    continue;
+                };
+
+                log::info!(
+                    "direct handshake to {} ({}) timed out after {}s; trying relay {} ({})",
+                    target_name,
+                    target_peer_id,
+                    relay_fallback_timeout_secs,
+                    relay_name,
+                    relay_id
+                );
+                log::debug!(
+                    "sending relayed discovery handshake_1 to {} ({}) via {} ({})",
+                    target_name,
+                    target_peer_id,
+                    relay_name,
+                    relay_addr
+                );
+                if let Err(e) = frag::send_fragmented_to_peer(
+                    &sock_fallback,
+                    &msg,
+                    relay_addr,
+                    &nw_key_fallback,
+                    max_datagram_fallback,
+                    target_peer_id,
+                ) {
+                    log::warn!(
+                        "relayed discovery handshake to {} ({}) via {} failed: {}",
+                        target_name,
+                        target_peer_id,
+                        relay_name,
+                        e
+                    );
+                    continue;
+                }
+
+                if let Ok(mut pending) = pending_fallback.lock() {
+                    if let Some(p) = pending.get_mut(&session_id) {
+                        if !p.relay_attempted {
+                            p.addr = relay_addr;
+                            p.sent_at = now;
+                            p.relay_attempted = true;
+                        }
+                    }
+                }
+                log::debug!(
+                    "sent relayed discovery handshake_1 to {} ({}) via {} ({})",
+                    target_name,
+                    target_peer_id,
+                    relay_name,
+                    relay_addr
+                );
+            }
+
+            thread::sleep(Duration::from_millis(250));
         }
     });
 
@@ -417,6 +543,46 @@ fn main() -> anyhow::Result<()> {
                         continue;
                     }
 
+                    if let Some(header) = packet::network_header(data, &nw_key_recv) {
+                        if header.dst_peer_id != 0 && header.dst_peer_id != our_id {
+                            if am_relay_recv {
+                                let relay_target = peers_recv.lock().ok().and_then(|peers| {
+                                    peers
+                                        .get(&header.dst_peer_id)
+                                        .map(|peer| (peer.addr, peer.name.clone()))
+                                });
+                                if let Some((addr, name)) = relay_target {
+                                    if let Err(e) = sock_recv.send_to(data, addr) {
+                                        log::warn!(
+                                            "relay to {} ({}) failed: {}",
+                                            name,
+                                            header.dst_peer_id,
+                                            e
+                                        );
+                                    } else {
+                                        log::trace!(
+                                            "relayed packet to {} ({}) via masked header",
+                                            name,
+                                            header.dst_peer_id
+                                        );
+                                    }
+                                } else {
+                                    log::debug!(
+                                        "relay target {} unavailable for packet from {}",
+                                        header.dst_peer_id,
+                                        src
+                                    );
+                                }
+                            } else {
+                                log::debug!(
+                                    "packet for {} ignored: relay mode disabled",
+                                    header.dst_peer_id
+                                );
+                            }
+                            continue;
+                        }
+                    }
+
                     let assembled = match frag_assembler.feed(src, data, &nw_key_recv) {
                         FeedResult::Complete(a) => {
                             log::debug!("reassembled fragmented message ({} bytes)", a.len());
@@ -427,8 +593,9 @@ fn main() -> anyhow::Result<()> {
                     };
 
                     let packet = assembled.as_deref().unwrap_or(data);
+                    let packet_header = packet::network_header(packet, &nw_key_recv);
 
-                    match handshake::handshake_kind(packet, &nw_key_recv) {
+                    match packet_header.map(|header| header.kind) {
                         Some(handshake::KIND_HANDSHAKE_1) => {
                             match handshake::process_handshake_1(
                                 packet,
@@ -452,12 +619,13 @@ fn main() -> anyhow::Result<()> {
                                     if let Ok(mut est) = established_recv.lock() {
                                         est.insert(src);
                                     }
-                                    if let Err(e) = frag::send_fragmented(
+                                    if let Err(e) = frag::send_fragmented_to_peer(
                                         &sock_recv,
                                         &resp.msg,
                                         src,
                                         &nw_key_recv,
                                         max_datagram_recv,
+                                        peer_id,
                                     ) {
                                         log::warn!("send hs response failed: {}", e);
                                         continue;
@@ -476,7 +644,9 @@ fn main() -> anyhow::Result<()> {
                         Some(handshake::KIND_HANDSHAKE_2) => {
                             let initiate = {
                                 if let Ok(mut pend) = pending_recv.lock() {
-                                    pend.remove(&src)
+                                    packet_header.and_then(|header| {
+                                        pend.remove(&header.session_id).map(|p| p.initiate)
+                                    })
                                 } else {
                                     None
                                 }
@@ -525,7 +695,7 @@ fn main() -> anyhow::Result<()> {
                                 continue;
                             };
 
-                            if header.dst_peer_id != our_id {
+                            if header.dst_peer_id != 0 && header.dst_peer_id != our_id {
                                 if am_relay_recv {
                                     let relay_target = peers_recv.lock().ok().and_then(|peers| {
                                         peers
@@ -865,12 +1035,19 @@ fn main() -> anyhow::Result<()> {
                                         &nw_key_recv,
                                         am_relay_recv,
                                     );
-                                    if let Err(e) = frag::send_fragmented(
+                                    log::debug!(
+                                        "sending direct discovery handshake_1 to {} ({}) at {}",
+                                        peer_cert.body.meta.name,
+                                        peer_id,
+                                        peer_addr
+                                    );
+                                    if let Err(e) = frag::send_fragmented_to_peer(
                                         &sock_recv,
                                         &init.msg,
                                         peer_addr,
                                         &nw_key_recv,
                                         max_datagram_recv,
+                                        peer_id,
                                     ) {
                                         log::warn!(
                                             "direct discovery handshake to {} failed: {}",
@@ -879,8 +1056,24 @@ fn main() -> anyhow::Result<()> {
                                         );
                                         continue;
                                     }
+                                    log::debug!(
+                                        "sent direct discovery handshake_1 to {} ({}) at {}",
+                                        peer_cert.body.meta.name,
+                                        peer_id,
+                                        peer_addr
+                                    );
                                     if let Ok(mut pend) = pending_recv.lock() {
-                                        pend.insert(peer_addr, init);
+                                        pend.insert(
+                                            init.my_rx_session_id,
+                                            PendingHandshake {
+                                                initiate: init,
+                                                addr: peer_addr,
+                                                peer_id: Some(peer_id),
+                                                peer_name: peer_cert.body.meta.name.clone(),
+                                                sent_at: unix_now_secs(),
+                                                relay_attempted: false,
+                                            },
+                                        );
                                     }
                                     if peer_is_relay {
                                         log::debug!(
@@ -1130,15 +1323,6 @@ fn main() -> anyhow::Result<()> {
                     let serialized = packet::serialize_packet(&pkt);
                     if let Err(e) = sock.send_to(&serialized, peer.addr) {
                         log::warn!("send_to {} failed: {}", peer_id, e);
-                    }
-
-                    for (relay_id, relay_peer) in peers
-                        .iter_mut()
-                        .filter(|(id, p)| p.is_relay && **id != peer_id)
-                    {
-                        if let Err(e) = sock.send_to(&serialized, relay_peer.addr) {
-                            log::warn!("relay via {} to {} failed: {}", relay_id, peer_id, e);
-                        }
                     }
                 }
                 Ok(_) => {} // zero-length read, ignore
