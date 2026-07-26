@@ -296,8 +296,8 @@ fn main() -> anyhow::Result<()> {
                     .collect();
                 let mut expired_sessions = Vec::new();
                 for id in &expired {
-                    log::info!("removing expired peer {}", id);
                     if let Some(peer) = p.remove(id) {
+                        log::info!("removing expired peer {} ({})", id, peer.name);
                         expired_sessions.push(peer.rx_session_id);
                     }
                 }
@@ -632,11 +632,6 @@ fn main() -> anyhow::Result<()> {
                                     }
                                 }
                                 Some((peer_id, PacketBody::LighthouseQuery { target_ip, .. })) => {
-                                    log::info!(
-                                        "lighthouse query from peer {} for {}",
-                                        peer_id,
-                                        target_ip
-                                    );
                                     if !am_lighthouse_recv {
                                         log::debug!(
                                             "lighthouse query for {} ignored: lighthouse mode disabled",
@@ -685,6 +680,13 @@ fn main() -> anyhow::Result<()> {
                                             requester_name,
                                         ) = requester_snapshot;
 
+                                        log::info!(
+                                            "lighthouse query from peer {} ({}) for {}",
+                                            peer_id,
+                                            requester_name,
+                                            target_ip
+                                        );
+
                                         let mut responses = Vec::new();
                                         if let Some((
                                             found_id,
@@ -695,8 +697,9 @@ fn main() -> anyhow::Result<()> {
                                         )) = target
                                         {
                                             log::info!(
-                                                "lighthouse resolved query from {} for {} -> {} ({}) at {}",
+                                                "lighthouse resolved query from {} ({}) for {} -> {} ({}) at {}",
                                                 peer_id,
+                                                requester_name,
                                                 target_ip,
                                                 found_name,
                                                 found_id,
@@ -765,9 +768,10 @@ fn main() -> anyhow::Result<()> {
                                             }
                                         } else {
                                             log::info!(
-                                                "lighthouse has no route for {} requested by {}",
+                                                "lighthouse has no route for {} requested by {} ({})",
                                                 target_ip,
-                                                peer_id
+                                                peer_id,
+                                                requester_name
                                             );
                                             if let Some(requester) = peers.get_mut(&peer_id) {
                                                 requester.tx_seq = requester.tx_seq.wrapping_add(1);
@@ -1064,7 +1068,7 @@ fn main() -> anyhow::Result<()> {
                 Ok(n) if n > 0 => {
                     let ip_packet = &tun_buf[..n];
                     let dst_ip = parse_dest_ip(ip_packet);
-                    log::debug!(
+                    log::trace!(
                         "tun packet dst {}",
                         dst_ip.map_or("?".into(), |ip| ip.to_string())
                     );
@@ -1073,11 +1077,11 @@ fn main() -> anyhow::Result<()> {
                         continue;
                     };
                     if dst_ip.is_multicast() {
-                        log::debug!("skipping multicast dst {}", dst_ip);
+                        log::trace!("skipping multicast dst {}", dst_ip);
                         continue;
                     }
                     if is_link_local(dst_ip) {
-                        log::debug!("skipping link-local dst {}", dst_ip);
+                        log::trace!("skipping link-local dst {}", dst_ip);
                         continue;
                     }
                     if is_overlay_broadcast(dst_ip, &overlay_networks) {
