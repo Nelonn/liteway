@@ -17,18 +17,6 @@ cargo build --release
 
 Two binaries: `litewayd` and `liteway-cert`.
 
-## Recommended IP Ranges
-
-Use one of the following private IPv4 ranges (RFC 1918) for the VPN network:
-
-| Range | CIDR | Usable Hosts |
-|-------|------|-------------|
-| `10.0.0.0` – `10.255.255.255` | `10.0.0.0/8` | 16,777,214 |
-| `172.16.0.0` – `172.31.255.255` | `172.16.0.0/12` | 1,048,574 |
-| `192.168.0.0` – `192.168.255.255` | `192.168.0.0/16` | 65,534 |
-
-Pick a `/24` (254 hosts) or smaller subnet for your mesh to avoid overlap with local networks. For example, `10.88.0.0/24`.
-
 ## 1. Certificate Management (`liteway-cert`)
 
 ### Generate CA
@@ -41,10 +29,24 @@ Produces `ca.toml` and `ca-key.toml`. The command also prints a separate `networ
 
 Optional groups: `-g engineering -g web`.
 
-### Generate Node Certificate
+## Recommended IP Ranges
+
+Use one of the following private IPv4 ranges (RFC 1918) for the VPN network:
+
+| Range | CIDR | Usable Hosts |
+|-------|------|-------------|
+| `10.0.0.0` – `10.255.255.255` | `10.0.0.0/8` | 16,777,214 |
+| `172.16.0.0` – `172.31.255.255` | `172.16.0.0/12` | 1,048,574 |
+| `192.168.0.0` – `192.168.255.255` | `192.168.0.0/16` | 65,534 |
+
+Pick a `/24` (254 hosts) or smaller subnet for your mesh to avoid overlap with local networks. For example, `10.88.0.0/24`.
+
+## 2. Public Node Setup
+
+Generate Node Certificate
 
 ```sh
-liteway-cert gen-node -n mynode -i 10.0.0.1/24
+liteway-cert gen-node -n publicnode -i 10.0.0.1/24
 ```
 
 - `-i` — TUN interface IP (CIDR)
@@ -54,16 +56,16 @@ liteway-cert gen-node -n mynode -i 10.0.0.1/24
 Advertised subnets require route grants as groups, for example
 `-g route:10.0.0.0/24`; `route:*` allows all non-default subnets.
 
-Produces public `mynode-cert.toml` and private `mynode-key.toml`.
+Produces public `publicnode-cert.toml` and private `publicnode-key.toml`.
 
-## 2. Public Node Configuration (`liteway.toml`)
+Public Node Configuration (`liteway.toml`):
 
 ```toml
 listen = "0.0.0.0:12345"
 network_secret = "<hex from gen-ca>"
-ca_cert_path = "ca.toml"
-node_cert_path = "mynode-cert.toml"
-node_key_path = "mynode-key.toml"
+ca_cert_path = "/ca.toml"
+node_cert_path = "/cert.toml"
+node_key_path = "/key.toml"
 am_lighthouse = true
 am_relay = true
 
@@ -77,48 +79,7 @@ handshake with it are registered by their certificate IP/subnets and UDP endpoin
 If another node has no route for a VPN IP, it asks connected lighthouses for the
 peer behind that IP and then starts a direct handshake to the returned endpoint.
 Lighthouse certificates are verified against the configured CA during the normal
-handshake; `[[lighthouses]]` only pins the underlay address to contact.
-
-## 3. Private Node Configuration (`liteway.toml`)
-
-```toml
-network_secret = "<hex from gen-ca>"
-ca_cert_path = "ca.toml"
-node_cert_path = "mynode-cert.toml"
-node_key_path = "mynode-key.toml"
-
-[interface]
-name = "liteway0"
-mtu = 1300
-
-[[lighthouses]]
-name = "lh1"
-address = "lh1.example.com:5678" # or "1.2.3.4:5678"
-```
-
-## 4. Daemon (`litewayd`)
-
-```sh
-# Linux (capability, no root needed)
-sudo setcap cap_net_admin+ep target/release/litewayd
-litewayd -c liteway.toml
-
-# macOS / Linux (root)
-sudo litewayd -c liteway.toml
-
-# Windows (Admin prompt)
-litewayd -c liteway.toml
-```
-
-## 5. Docker compose
-
-Add this to config:
-
-```yaml
-ca_cert_path = "/ca.toml"
-node_cert_path = "/cert.toml"
-node_key_path = "/key.toml"
-```
+handshake
 
 And use this docker-compose.yml:
 
@@ -139,7 +100,48 @@ services:
       - ./mynode-key.toml:/key.toml
 ```
 
-## 6. Full config
+Then run `docker compose up -d`
+
+## 3. Private Node Setup
+
+Generate Node Certificate
+
+```sh
+liteway-cert gen-node -n privatenode -i 10.0.0.2/24
+```
+
+Private Node Configuration (`liteway.toml`):
+
+```toml
+network_secret = "<hex from gen-ca>"
+ca_cert_path = "ca.toml"
+node_cert_path = "mynode-cert.toml"
+node_key_path = "mynode-key.toml"
+
+[interface]
+name = "liteway0"
+mtu = 1300
+
+[[lighthouses]]
+name = "lh1"
+address = "lh1.example.com:5678" # or "1.2.3.4:5678"
+```
+
+Then run daemon:
+
+```sh
+# Linux (capability, no root needed)
+sudo setcap cap_net_admin+ep target/release/litewayd
+litewayd -c liteway.toml
+
+# macOS / Linux (root)
+sudo litewayd -c liteway.toml
+
+# Windows (Admin prompt)
+litewayd -c liteway.toml
+```
+
+## See full config reference
 
 ```yaml
 # keep following line is needed only for lighthouse or relay setup
