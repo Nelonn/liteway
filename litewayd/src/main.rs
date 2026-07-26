@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -144,9 +144,17 @@ fn main() -> anyhow::Result<()> {
 
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
+    let shutdown_signals = Arc::new(AtomicUsize::new(0));
+    let signals = shutdown_signals.clone();
     ctrlc::set_handler(move || {
-        log::info!("shutdown requested");
-        r.store(false, Ordering::SeqCst);
+        let count = signals.fetch_add(1, Ordering::SeqCst) + 1;
+        if count == 1 {
+            log::info!("shutdown requested; press Ctrl-C again to terminate immediately");
+            r.store(false, Ordering::SeqCst);
+        } else {
+            log::warn!("second shutdown signal received; terminating immediately");
+            std::process::exit(130);
+        }
     })
     .context("install Ctrl-C handler")?;
 
@@ -255,10 +263,14 @@ fn main() -> anyhow::Result<()> {
     let am_relay_punch = config.am_relay;
     let keepalive_punch = config.keepalive_punch;
     let keepalive_timeout_secs = config.keepalive_timeout_secs;
+    let running_punch = running.clone();
     thread::spawn(move || {
         let lighthouses = cfg_punch.lighthouses.clone();
-        loop {
+        while running_punch.load(Ordering::SeqCst) {
             for lh in &lighthouses {
+                if !running_punch.load(Ordering::SeqCst) {
+                    break;
+                }
                 if let Ok(est) = established_punch.lock() {
                     if est.contains(&lh.address) {
                         if keepalive_punch {
@@ -315,7 +327,10 @@ fn main() -> anyhow::Result<()> {
             if lighthouses.is_empty() {
                 break;
             }
-            thread::sleep(Duration::from_secs(cfg_punch.punch_interval_secs));
+            sleep_while_running(
+                Duration::from_secs(cfg_punch.punch_interval_secs),
+                &running_punch,
+            );
         }
     });
 
@@ -1821,6 +1836,17 @@ fn unix_now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs()
+}
+
+fn sleep_while_running(duration: Duration, running: &AtomicBool) {
+    let mut slept = Duration::ZERO;
+    let step = Duration::from_millis(100);
+    while slept < duration && running.load(Ordering::SeqCst) {
+        let remaining = duration.saturating_sub(slept);
+        let chunk = remaining.min(step);
+        thread::sleep(chunk);
+        slept += chunk;
+    }
 }
 
 fn parse_dest_ip(packet: &[u8]) -> Option<IpAddr> {
