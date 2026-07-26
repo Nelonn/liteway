@@ -101,7 +101,7 @@ pub fn create_handshake_1(
     plaintext.extend_from_slice(&sig.ml_dsa);
     add_random_padding(&mut plaintext);
 
-    let msg = seal_handshake(network_key, &plaintext);
+    let msg = seal_handshake_with_header(network_key, &plaintext, 0, my_rx_session_id);
 
     HandshakeInitiate {
         msg,
@@ -160,7 +160,7 @@ pub fn process_handshake_1(
     plaintext2.extend_from_slice(&sig.ml_dsa);
     add_random_padding(&mut plaintext2);
 
-    let msg = seal_handshake(network_key, &plaintext2);
+    let msg = seal_handshake_with_header(network_key, &plaintext2, 0, hs1.rx_session_id);
     let session_key = derive_session_v2(&*hybrid_ss, data, &msg);
 
     Ok(HandshakeResponse {
@@ -206,8 +206,28 @@ pub fn process_handshake_2(
     })
 }
 
-pub(crate) fn seal_handshake(network_key: &[u8; K_HEADER_LEN], plaintext: &[u8]) -> Vec<u8> {
-    let (header, payload) = handshake_header_and_payload(plaintext);
+pub(crate) fn seal_handshake_to_peer(
+    network_key: &[u8; K_HEADER_LEN],
+    plaintext: &[u8],
+    dst_peer_id: u32,
+) -> Vec<u8> {
+    let session_id = if plaintext.len() >= 7 && plaintext[0] == KIND_HANDSHAKE_FRAG {
+        u32::from_be_bytes([plaintext[1], plaintext[2], plaintext[3], plaintext[4]])
+    } else {
+        0
+    };
+    seal_handshake_with_header(network_key, plaintext, dst_peer_id, session_id)
+}
+
+fn seal_handshake_with_header(
+    network_key: &[u8; K_HEADER_LEN],
+    plaintext: &[u8],
+    dst_peer_id: u32,
+    session_id: u32,
+) -> Vec<u8> {
+    let (mut header, payload) = handshake_header_and_payload(plaintext);
+    header.dst_peer_id = dst_peer_id;
+    header.session_id = session_id;
     let mut mask_nonce = [0u8; MASK_NONCE_LEN];
     let mut nonce = [0u8; NONCE_LEN];
     ThreadRng::default().fill_bytes(&mut mask_nonce);

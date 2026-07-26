@@ -580,6 +580,7 @@ fn app_config_with_secret(network_secret: &str) -> AppConfig {
         punch_interval_secs: 10,
         keepalive_punch: true,
         keepalive_timeout_secs: 30,
+        relay_fallback_timeout_secs: 5,
     }
 }
 
