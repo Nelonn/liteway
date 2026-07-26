@@ -93,7 +93,7 @@ mtu = 1300
 
 [[lighthouses]]
 name = "lh1"
-address = "1.2.3.4:5678"
+address = "lh1.example.com:5678" # or "1.2.3.4:5678"
 ```
 
 ## 4. Daemon (`litewayd`)

@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -29,6 +29,12 @@ const ROUTE_GRANT_PREFIX: &str = "route:";
 struct KeepalivePending {
     token: u64,
     sent_at: u64,
+}
+
+#[derive(Clone)]
+struct ResolvedLighthouse {
+    name: String,
+    address: SocketAddr,
 }
 
 struct PendingHandshake {
@@ -246,6 +252,7 @@ fn main() -> anyhow::Result<()> {
     }
     let max_datagram = udp_payload_limit(&config, actual_listen);
     log::debug!("fragment UDP payload limit set to {} bytes", max_datagram);
+    let resolved_lighthouses = resolve_lighthouses(&config.lighthouses)?;
 
     let peers: Arc<Mutex<HashMap<u32, PeerState>>> = Arc::new(Mutex::new(HashMap::new()));
     let pending: Arc<Mutex<HashMap<u32, PendingHandshake>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -261,7 +268,8 @@ fn main() -> anyhow::Result<()> {
     let established_punch = established.clone();
     let keepalive_pending_punch = keepalive_pending.clone();
     let nw_key_punch = network_key;
-    let cfg_punch = config.clone();
+    let lighthouses_punch = resolved_lighthouses.clone();
+    let punch_interval_secs = config.punch_interval_secs;
     let sock_punch = sock.try_clone()?;
     let cert_punch: Cert = node_cert.clone();
     let sign_sk_punch = node_key.signing_secret_key.clone();
@@ -273,9 +281,8 @@ fn main() -> anyhow::Result<()> {
     let running_punch = running.clone();
     let shutdown_cv_punch = shutdown_cv.clone();
     thread::spawn(move || {
-        let lighthouses = cfg_punch.lighthouses.clone();
         while running_punch.load(Ordering::SeqCst) {
-            for lh in &lighthouses {
+            for lh in &lighthouses_punch {
                 if !running_punch.load(Ordering::SeqCst) {
                     break;
                 }
@@ -332,11 +339,11 @@ fn main() -> anyhow::Result<()> {
                     );
                 }
             }
-            if lighthouses.is_empty() {
+            if lighthouses_punch.is_empty() {
                 break;
             }
             wait_for_shutdown_or_timeout(
-                Duration::from_secs(cfg_punch.punch_interval_secs),
+                Duration::from_secs(punch_interval_secs),
                 &shutdown_cv_punch,
             );
         }
@@ -1398,7 +1405,7 @@ fn main() -> anyhow::Result<()> {
     // === Send path (main thread) ===
     let mut tun_buf = [0u8; 65535];
     let mut discovery_pending: HashMap<IpAddr, u64> = HashMap::new();
-    let lighthouses_send = config.lighthouses.clone();
+    let lighthouses_send = resolved_lighthouses.clone();
     while running.load(Ordering::SeqCst) {
         if let Some(ref mut tun_reader) = tun_reader {
             match tun_reader.read(&mut tun_buf) {
@@ -1536,7 +1543,7 @@ fn main() -> anyhow::Result<()> {
 
 fn request_lighthouse_discovery(
     dst_ip: IpAddr,
-    lighthouses: &[LighthouseConfig],
+    lighthouses: &[ResolvedLighthouse],
     peers: &Arc<Mutex<HashMap<u32, PeerState>>>,
     sock: &std::net::UdpSocket,
     network_key: &[u8; 32],
@@ -1603,7 +1610,7 @@ fn request_lighthouse_discovery(
 }
 
 fn send_lighthouse_keepalive(
-    lighthouse: &LighthouseConfig,
+    lighthouse: &ResolvedLighthouse,
     peers: &Arc<Mutex<HashMap<u32, PeerState>>>,
     keepalive_pending: &Arc<Mutex<HashMap<u32, KeepalivePending>>>,
     sock: &std::net::UdpSocket,
@@ -1687,6 +1694,40 @@ fn udp_payload_limit(config: &AppConfig, listen: SocketAddr) -> usize {
     let ip_udp_overhead = if listen.is_ipv6() { 48 } else { 28 };
     let mtu_payload = usize::from(iface.mtu).saturating_sub(ip_udp_overhead);
     mtu_payload.clamp(frag::MIN_DATAGRAM, frag::DEFAULT_MAX_DATAGRAM)
+}
+
+fn resolve_lighthouses(
+    lighthouses: &[LighthouseConfig],
+) -> anyhow::Result<Vec<ResolvedLighthouse>> {
+    let mut resolved = Vec::with_capacity(lighthouses.len());
+    for lighthouse in lighthouses {
+        let mut addrs = lighthouse.address.to_socket_addrs().with_context(|| {
+            format!(
+                "resolve lighthouse '{}' address '{}'",
+                lighthouse.name, lighthouse.address
+            )
+        })?;
+        let address = addrs.next().ok_or_else(|| {
+            anyhow::anyhow!(
+                "lighthouse '{}' address '{}' resolved to no socket addresses",
+                lighthouse.name,
+                lighthouse.address
+            )
+        })?;
+        if lighthouse.address != address.to_string() {
+            log::info!(
+                "resolved lighthouse {} {} -> {}",
+                lighthouse.name,
+                lighthouse.address,
+                address
+            );
+        }
+        resolved.push(ResolvedLighthouse {
+            name: lighthouse.name.clone(),
+            address,
+        });
+    }
+    Ok(resolved)
 }
 
 fn host_route(addr: &str) -> anyhow::Result<IpNetwork> {
