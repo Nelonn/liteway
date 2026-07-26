@@ -1,0 +1,38 @@
+[workspace]
+resolver = "2"
+members = ["liteway-core", "litewayd", "liteway-cert", "liteway-net"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+hex = { version = "0.4", default-features = false, features = ["serde", "std"] }
+anyhow = "1"
+thiserror = "2"
+clap = { version = "4", default-features = false, features = ["derive", "help", "usage", "error-context", "std"] }
+rand = "0.10"
+rand_core = { version = "0.10" }
+zeroize = { version = "1", features = ["zeroize_derive"] }
+blake3 = { version = "1", default-features = false }
+chacha20poly1305 = "0.11"
+x25519-dalek = { version = "3", features = ["static_secrets", "reusable_secrets"] }
+ed25519-dalek = { version = "3", default-features = false, features = ["pem", "alloc", "zeroize", "signature", "fast"] }
+ml-kem = "0.3"
+ml-dsa = "0.1"
+tun = "0.8"
+ipnetwork = "0.21"
+chrono = { version = "0.4", default-features = false, features = ["serde", "clock", "std"] }
+log = "0.4"
+env_logger = { version = "0.11", default-features = false, features = ["auto-color", "color"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = 1

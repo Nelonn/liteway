@@ -1,0 +1,27 @@
+[package]
+name = "liteway-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ipnetwork.workspace = true
+log.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rtnetlink = "0.14"
+tokio = { version = "1", default-features = false, features = ["rt"] }
+futures = "0.3"
+libc = "0.2"
+netlink-packet-route = "0.19"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+]}

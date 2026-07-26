@@ -1,0 +1,19 @@
+[package]
+name = "liteway-cert"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+liteway-core = { path = "../liteway-core" }
+anyhow.workspace = true
+clap.workspace = true
+log.workspace = true
+env_logger.workspace = true
+toml.workspace = true
+serde.workspace = true
+chrono.workspace = true
+rand_core.workspace = true
+rand.workspace = true
+hex.workspace = true
+ipnetwork.workspace = true

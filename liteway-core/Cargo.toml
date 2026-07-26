@@ -1,0 +1,27 @@
+[package]
+name = "liteway-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+hex.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+rand.workspace = true
+rand_core.workspace = true
+zeroize.workspace = true
+blake3.workspace = true
+chacha20poly1305.workspace = true
+x25519-dalek.workspace = true
+ed25519-dalek.workspace = true
+ml-kem.workspace = true
+ml-dsa.workspace = true
+tun.workspace = true
+ipnetwork.workspace = true
+chrono.workspace = true
+log.workspace = true
+liteway-net = { path = "../liteway-net" }

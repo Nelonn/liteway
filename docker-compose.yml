@@ -1,0 +1,15 @@
+services:
+  liteway:
+    build:
+      context: .
+    restart: unless-stopped
+    network_mode: host
+    devices:
+      - /dev/net/tun
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - ./liteway.toml:/liteway.toml
+      - ./ca.toml:/ca.toml
+      - ./mynode-key.toml:/mynode-key.toml
+      - ./mynode-cert.toml:/mynode-cert.toml

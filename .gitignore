@@ -1,0 +1,9 @@
+/target
+liteway.toml
+ca.toml
+ca-key.toml
+mynode-cert.toml
+mynode-key.toml
+
+# Common
+.DS_Store

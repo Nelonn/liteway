@@ -1,0 +1,21 @@
+[package]
+name = "litewayd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+liteway-core = { path = "../liteway-core" }
+liteway-net = { path = "../liteway-net" }
+anyhow.workspace = true
+clap.workspace = true
+log.workspace = true
+env_logger.workspace = true
+toml.workspace = true
+serde.workspace = true
+blake3.workspace = true
+ipnetwork.workspace = true
+zeroize.workspace = true
+rand.workspace = true
+ctrlc = "3.4"
+socket2 = "0.5"
