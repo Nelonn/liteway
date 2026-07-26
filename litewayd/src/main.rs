@@ -40,6 +40,12 @@ struct PendingHandshake {
     relay_attempted: bool,
 }
 
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum AddPeerOutcome {
+    Added,
+    KeptExisting,
+}
+
 struct RouteTable {
     routes: Vec<(IpNetwork, u32)>,
 }
@@ -476,13 +482,57 @@ fn main() -> anyhow::Result<()> {
                         addr: SocketAddr,
                         is_relay: bool,
                         tx_session_id: u32,
-                        rx_session_id: u32| {
-            let tx_key = packet::derive_traffic_key(&sk, our_id, id);
-            let rx_key = packet::derive_traffic_key(&sk, id, our_id);
+                        rx_session_id: u32,
+                        initiator_id: u32,
+                        simultaneous: bool| {
+            let mut tx_key = packet::derive_traffic_key(&sk, our_id, id);
+            let mut rx_key = packet::derive_traffic_key(&sk, id, our_id);
             sk.zeroize();
             let routes = authorized_peer_routes(cert);
             let mut old_rx_session_id = None;
+            let mut added = false;
+            let now = unix_now_secs();
             if let Ok(mut p) = peers_add.lock() {
+                if let Some(existing) = p.get(&id) {
+                    let preferred_initiator = our_id.min(id);
+                    if simultaneous && initiator_id != preferred_initiator {
+                        log::debug!(
+                            "ignoring simultaneous handshake with {} ({}) initiated by {}; preferred initiator is {}",
+                            cert.body.meta.name,
+                            id,
+                            initiator_id,
+                            preferred_initiator
+                        );
+                        tx_key.zeroize();
+                        rx_key.zeroize();
+                        return AddPeerOutcome::KeptExisting;
+                    }
+                    if simultaneous
+                        && existing.handshake_initiator_id != preferred_initiator
+                        && initiator_id == preferred_initiator
+                    {
+                        log::debug!(
+                            "replacing simultaneous handshake with {} ({}) using preferred initiator {}",
+                            cert.body.meta.name,
+                            id,
+                            initiator_id
+                        );
+                    }
+                } else {
+                    let preferred_initiator = our_id.min(id);
+                    if simultaneous && initiator_id != preferred_initiator {
+                        log::debug!(
+                            "waiting for preferred simultaneous handshake with {} ({}); ignoring session initiated by {}",
+                            cert.body.meta.name,
+                            id,
+                            initiator_id
+                        );
+                        tx_key.zeroize();
+                        rx_key.zeroize();
+                        return AddPeerOutcome::KeptExisting;
+                    }
+                }
+
                 old_rx_session_id = p
                     .insert(
                         id,
@@ -497,14 +547,18 @@ fn main() -> anyhow::Result<()> {
                             rx_session_id,
                             tx_seq: 0,
                             rx_replay: ReplayWindow::new(),
-                            last_seen: SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap()
-                                .as_secs(),
+                            last_seen: now,
                             routes: routes.clone(),
+                            handshake_initiator_id: initiator_id,
                         },
                     )
                     .map(|old| old.rx_session_id);
+                added = true;
+            }
+            if !added {
+                tx_key.zeroize();
+                rx_key.zeroize();
+                return AddPeerOutcome::KeptExisting;
             }
 
             if let Ok(mut sessions) = rx_sessions_add.lock() {
@@ -536,6 +590,8 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
             }
+
+            AddPeerOutcome::Added
         };
 
         while running_recv.load(Ordering::SeqCst) {
@@ -613,7 +669,11 @@ fn main() -> anyhow::Result<()> {
                             ) {
                                 Ok(resp) => {
                                     let peer_id = node_id_from_cert(&resp.peer_cert);
-                                    add_peer(
+                                    let simultaneous =
+                                        pending_recv.lock().ok().is_some_and(|pend| {
+                                            pend.values().any(|p| p.peer_id == Some(peer_id))
+                                        });
+                                    let outcome = add_peer(
                                         peer_id,
                                         resp.session_key,
                                         &resp.peer_cert,
@@ -621,9 +681,13 @@ fn main() -> anyhow::Result<()> {
                                         resp.peer_is_relay,
                                         resp.peer_rx_session_id,
                                         resp.my_rx_session_id,
+                                        peer_id,
+                                        simultaneous,
                                     );
-                                    if let Ok(mut est) = established_recv.lock() {
-                                        est.insert(src);
+                                    if outcome == AddPeerOutcome::Added {
+                                        if let Ok(mut est) = established_recv.lock() {
+                                            est.insert(src);
+                                        }
                                     }
                                     if let Err(e) = frag::send_fragmented_to_peer(
                                         &sock_recv,
@@ -636,11 +700,19 @@ fn main() -> anyhow::Result<()> {
                                         log::warn!("send hs response failed: {}", e);
                                         continue;
                                     }
-                                    log::info!(
-                                        "handshake complete with {} ({})",
-                                        resp.peer_cert.body.meta.name,
-                                        src
-                                    );
+                                    if outcome == AddPeerOutcome::Added {
+                                        log::info!(
+                                            "handshake complete with {} ({})",
+                                            resp.peer_cert.body.meta.name,
+                                            src
+                                        );
+                                    } else {
+                                        log::debug!(
+                                            "handshake response sent to {} ({}); existing session kept",
+                                            resp.peer_cert.body.meta.name,
+                                            src
+                                        );
+                                    }
                                 }
                                 Err(e) => {
                                     log::debug!("handshake_1 from {} failed: {}", src, e);
@@ -648,26 +720,30 @@ fn main() -> anyhow::Result<()> {
                             }
                         }
                         Some(handshake::KIND_HANDSHAKE_2) => {
-                            let initiate = {
+                            let pending_handshake = {
                                 if let Ok(mut pend) = pending_recv.lock() {
-                                    packet_header.and_then(|header| {
-                                        pend.remove(&header.session_id).map(|p| p.initiate)
-                                    })
+                                    packet_header.and_then(|header| pend.remove(&header.session_id))
                                 } else {
                                     None
                                 }
                             };
-                            match initiate {
-                                Some(ih) => {
+                            match pending_handshake {
+                                Some(pending_hs) => {
                                     match handshake::process_handshake_2(
                                         packet,
-                                        ih,
+                                        pending_hs.initiate,
                                         &nw_key_recv,
                                         &ca_vk_recv,
                                     ) {
                                         Ok(result) => {
                                             let peer_id = node_id_from_cert(&result.peer_cert);
-                                            add_peer(
+                                            let simultaneous =
+                                                peers_recv.lock().ok().is_some_and(|peers| {
+                                                    peers.get(&peer_id).is_some_and(|existing| {
+                                                        existing.handshake_initiator_id != our_id
+                                                    })
+                                                });
+                                            let outcome = add_peer(
                                                 peer_id,
                                                 result.session_key,
                                                 &result.peer_cert,
@@ -675,15 +751,27 @@ fn main() -> anyhow::Result<()> {
                                                 result.peer_is_relay,
                                                 result.peer_rx_session_id,
                                                 result.my_rx_session_id,
+                                                our_id,
+                                                simultaneous,
                                             );
-                                            if let Ok(mut est) = established_recv.lock() {
-                                                est.insert(src);
+                                            if outcome == AddPeerOutcome::Added {
+                                                if let Ok(mut est) = established_recv.lock() {
+                                                    est.insert(src);
+                                                }
                                             }
-                                            log::info!(
-                                                "handshake confirmed with {} ({})",
-                                                result.peer_cert.body.meta.name,
-                                                src
-                                            );
+                                            if outcome == AddPeerOutcome::Added {
+                                                log::info!(
+                                                    "handshake confirmed with {} ({})",
+                                                    result.peer_cert.body.meta.name,
+                                                    src
+                                                );
+                                            } else {
+                                                log::debug!(
+                                                    "handshake confirmed with {} ({}); existing session kept",
+                                                    result.peer_cert.body.meta.name,
+                                                    src
+                                                );
+                                            }
                                         }
                                         Err(e) => {
                                             log::debug!("handshake_2 from {} failed: {}", src, e);
@@ -1787,6 +1875,7 @@ struct PeerState {
     rx_replay: ReplayWindow,
     last_seen: u64,
     routes: Vec<IpNetwork>,
+    handshake_initiator_id: u32,
 }
 
 impl Drop for PeerState {
