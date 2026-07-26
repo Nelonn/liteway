@@ -44,11 +44,7 @@ Optional groups: `-g engineering -g web`.
 ### Generate Node Certificate
 
 ```sh
-liteway-cert gen-node \
-  -n mynode \
-  -i 10.0.0.1/24 \
-  -s 10.0.0.0/24 \
-  -o mynode
+liteway-cert gen-node -n mynode -i 10.0.0.1/24
 ```
 
 - `-i` — TUN interface IP (CIDR)
@@ -64,12 +60,6 @@ Produces public `mynode-cert.toml` and private `mynode-key.toml`.
 
 ```sh
 liteway-cert verify -c mynode-cert.toml --ca-cert ca.toml
-```
-
-### Show Certificate
-
-```sh
-liteway-cert show -c mynode-cert.toml
 ```
 
 ### Generate Lighthouse Config Entry
