@@ -27,24 +27,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - suffix: ""
-            dockerfile: docker/litewayd.Dockerfile
-            arch: amd64
+          - arch: amd64
             platform: linux/amd64
             runner: ubuntu-24.04
-          - suffix: ""
-            dockerfile: docker/litewayd.Dockerfile
-            arch: arm64
-            platform: linux/arm64
-            runner: ubuntu-24.04-arm
-          - suffix: "-cert"
-            dockerfile: docker/liteway-cert.Dockerfile
-            arch: amd64
-            platform: linux/amd64
-            runner: ubuntu-24.04
-          - suffix: "-cert"
-            dockerfile: docker/liteway-cert.Dockerfile
-            arch: arm64
+          - arch: arm64
             platform: linux/arm64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
@@ -56,7 +42,7 @@ jobs:
       - name: Set image name
         id: image
         run: |
-          IMG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}${{ matrix.suffix }}"
+          IMG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
           echo "name=${IMG,,}" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
@@ -74,7 +60,7 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
-          file: ${{ matrix.dockerfile }}
+          file: Dockerfile
           platforms: ${{ matrix.platform }}
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.image.outputs.name }}:${{ matrix.arch }}-${{ github.sha }}
@@ -91,6 +77,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
+      - name: Set image name
+        id: image
+        run: |
+          IMG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          echo "name=${IMG,,}" >> "$GITHUB_OUTPUT"
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
@@ -101,28 +93,22 @@ jobs:
           username: ${{ env.REGISTRY_USER }}
           password: ${{ env.REGISTRY_TOKEN }}
 
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: |
+            type=raw,value=nightly,enable=${{ github.ref == 'refs/heads/main' }}
+            type=ref,event=tag
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+
       - name: Create and push multi-arch manifest
         shell: bash
         run: |
-          for img in "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}" "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-cert"; do
-            img="${img,,}"
-
-            if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
-              docker buildx imagetools create \
-                -t "${img}:nightly" \
-                "${img}:amd64-${{ github.sha }}" \
-                "${img}:arm64-${{ github.sha }}"
-            fi
-
-            if [[ "${{ github.ref }}" =~ ^refs/tags/v ]]; then
-              docker buildx imagetools create \
-                -t "${img}:${{ github.ref_name }}" \
-                "${img}:amd64-${{ github.sha }}" \
-                "${img}:arm64-${{ github.sha }}"
-
-              docker buildx imagetools create \
-                -t "${img}:latest" \
-                "${img}:amd64-${{ github.sha }}" \
-                "${img}:arm64-${{ github.sha }}"
-            fi
-          done
+          while IFS= read -r tag; do
+            docker buildx imagetools create \
+              -t "$tag" \
+              "${{ steps.image.outputs.name }}:amd64-${{ github.sha }}" \
+              "${{ steps.image.outputs.name }}:arm64-${{ github.sha }}"
+          done <<< "${{ steps.meta.outputs.tags }}"

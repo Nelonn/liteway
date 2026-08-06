@@ -2,7 +2,6 @@ services:
   liteway:
     build:
       context: .
-      dockerfile: docker/litewayd.Dockerfile
     restart: unless-stopped
     network_mode: host
     devices:
