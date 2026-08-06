@@ -1,7 +1,7 @@
 FROM rust:slim-trixie AS builder
 WORKDIR /build
 COPY . .
-RUN cargo build --release --bin litewayd
+RUN cargo build --release --bin litewayd liteway-cert
 
 FROM debian:trixie-slim
 COPY --from=builder /build/target/release/litewayd /usr/local/bin/
