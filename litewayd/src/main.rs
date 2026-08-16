@@ -265,6 +265,8 @@ fn main() -> anyhow::Result<()> {
     // === Punch thread ===
     let pending_punch = pending.clone();
     let peers_punch = peers.clone();
+    let route_map_punch = route_map.clone();
+    let rx_sessions_punch = rx_sessions.clone();
     let established_punch = established.clone();
     let keepalive_pending_punch = keepalive_pending.clone();
     let nw_key_punch = network_key;
@@ -286,24 +288,49 @@ fn main() -> anyhow::Result<()> {
                 if !running_punch.load(Ordering::SeqCst) {
                     break;
                 }
-                if let Ok(est) = established_punch.lock() {
-                    if est.contains(&lh.address) {
-                        if keepalive_punch {
-                            send_lighthouse_keepalive(
-                                lh,
-                                &peers_punch,
-                                &keepalive_pending_punch,
-                                &sock_punch,
-                                &nw_key_punch,
-                                max_datagram_punch,
-                                keepalive_timeout_secs,
-                            );
-                        } else {
-                            log::debug!(
-                                "skipping punch to {} - handshake already established",
-                                lh.name
-                            );
-                        }
+                let peer_is_established = {
+                    let in_est = established_punch
+                        .lock()
+                        .ok()
+                        .is_some_and(|est| est.contains(&lh.address));
+                    let in_peers = peers_punch
+                        .lock()
+                        .ok()
+                        .is_some_and(|p| p.values().any(|peer| peer.name == lh.name));
+                    in_est || in_peers
+                };
+                if peer_is_established {
+                    if keepalive_punch {
+                        send_lighthouse_keepalive(
+                            lh,
+                            &peers_punch,
+                            &established_punch,
+                            &route_map_punch,
+                            &rx_sessions_punch,
+                            &keepalive_pending_punch,
+                            &sock_punch,
+                            &nw_key_punch,
+                            max_datagram_punch,
+                            keepalive_timeout_secs,
+                        );
+                    } else {
+                        log::debug!(
+                            "skipping punch to {} - handshake already established",
+                            lh.name
+                        );
+                    }
+                    let still_established = {
+                        let in_est = established_punch
+                            .lock()
+                            .ok()
+                            .is_some_and(|est| est.contains(&lh.address));
+                        let in_peers = peers_punch
+                            .lock()
+                            .ok()
+                            .is_some_and(|p| p.values().any(|peer| peer.name == lh.name));
+                        in_est || in_peers
+                    };
+                    if still_established {
                         continue;
                     }
                 }
@@ -465,6 +492,7 @@ fn main() -> anyhow::Result<()> {
     let peers_clean = peers.clone();
     let route_clean = route_map.clone();
     let rx_sessions_clean = rx_sessions.clone();
+    let established_clean = established.clone();
     let running_clean = running.clone();
     thread::spawn(move || {
         while running_clean.load(Ordering::SeqCst) {
@@ -480,10 +508,15 @@ fn main() -> anyhow::Result<()> {
                     .map(|(id, _)| *id)
                     .collect();
                 let mut expired_sessions = Vec::new();
+                let mut expired_addrs = Vec::new();
                 for id in &expired {
                     if let Some(peer) = p.remove(id) {
-                        log::info!("removing expired peer {} ({})", id, peer.name);
+                        let peer_ip = primary_cert_ip(&peer.cert)
+                            .map(|ip| ip.to_string())
+                            .unwrap_or_else(|| "?".to_string());
+                        log::info!("removing expired peer {} [{}] ({})", id, peer_ip, peer.name);
                         expired_sessions.push(peer.rx_session_id);
+                        expired_addrs.push(peer.addr);
                     }
                 }
                 if let Ok(mut r) = route_clean.lock() {
@@ -494,6 +527,11 @@ fn main() -> anyhow::Result<()> {
                 if let Ok(mut sessions) = rx_sessions_clean.lock() {
                     for session_id in expired_sessions {
                         sessions.remove(&session_id);
+                    }
+                }
+                if let Ok(mut est) = established_clean.lock() {
+                    for addr in expired_addrs {
+                        est.remove(&addr);
                     }
                 }
             }
@@ -539,6 +577,7 @@ fn main() -> anyhow::Result<()> {
             sk.zeroize();
             let routes = authorized_peer_routes(cert);
             let mut old_rx_session_id = None;
+            let mut old_addr = None;
             let mut added = false;
             let now = unix_now_secs();
             if let Ok(mut p) = peers_add.lock() {
@@ -575,32 +614,42 @@ fn main() -> anyhow::Result<()> {
                     );
                 }
 
-                old_rx_session_id = p
-                    .insert(
-                        id,
-                        PeerState {
-                            name: cert.body.meta.name.clone(),
-                            cert: cert.clone(),
-                            tx_key,
-                            rx_key,
-                            addr,
-                            is_relay,
-                            tx_session_id,
-                            rx_session_id,
-                            tx_seq: 0,
-                            rx_replay: ReplayWindow::new(),
-                            last_seen: now,
-                            routes: routes.clone(),
-                            handshake_initiator_id: initiator_id,
-                        },
-                    )
-                    .map(|old| old.rx_session_id);
+                let old_peer = p.insert(
+                    id,
+                    PeerState {
+                        name: cert.body.meta.name.clone(),
+                        cert: cert.clone(),
+                        tx_key,
+                        rx_key,
+                        addr,
+                        is_relay,
+                        tx_session_id,
+                        rx_session_id,
+                        tx_seq: 0,
+                        rx_replay: ReplayWindow::new(),
+                        last_seen: now,
+                        routes: routes.clone(),
+                        handshake_initiator_id: initiator_id,
+                    },
+                );
+                if let Some(old) = old_peer {
+                    old_rx_session_id = Some(old.rx_session_id);
+                    old_addr = Some(old.addr);
+                }
                 added = true;
             }
             if !added {
                 tx_key.zeroize();
                 rx_key.zeroize();
                 return AddPeerOutcome::KeptExisting;
+            }
+
+            if let Some(old_a) = old_addr {
+                if old_a != addr {
+                    if let Ok(mut est) = established_recv.lock() {
+                        est.remove(&old_a);
+                    }
+                }
             }
 
             if let Ok(mut sessions) = rx_sessions_add.lock() {
@@ -742,16 +791,21 @@ fn main() -> anyhow::Result<()> {
                                         log::warn!("send hs response failed: {}", e);
                                         continue;
                                     }
+                                    let peer_ip = primary_cert_ip(&resp.peer_cert)
+                                        .map(|ip| ip.to_string())
+                                        .unwrap_or_else(|| "?".to_string());
                                     if outcome == AddPeerOutcome::Added {
                                         log::info!(
-                                            "handshake complete with {} ({})",
+                                            "handshake complete with {} [{}] ({})",
                                             resp.peer_cert.body.meta.name,
+                                            peer_ip,
                                             src
                                         );
                                     } else {
                                         log::debug!(
-                                            "handshake response sent to {} ({}); existing session kept",
+                                            "handshake response sent to {} [{}] ({}); existing session kept",
                                             resp.peer_cert.body.meta.name,
+                                            peer_ip,
                                             src
                                         );
                                     }
@@ -801,16 +855,21 @@ fn main() -> anyhow::Result<()> {
                                                     est.insert(src);
                                                 }
                                             }
+                                            let peer_ip = primary_cert_ip(&result.peer_cert)
+                                                .map(|ip| ip.to_string())
+                                                .unwrap_or_else(|| "?".to_string());
                                             if outcome == AddPeerOutcome::Added {
                                                 log::info!(
-                                                    "handshake confirmed with {} ({})",
+                                                    "handshake confirmed with {} [{}] ({})",
                                                     result.peer_cert.body.meta.name,
+                                                    peer_ip,
                                                     src
                                                 );
                                             } else {
                                                 log::debug!(
-                                                    "handshake confirmed with {} ({}); existing session kept",
+                                                    "handshake confirmed with {} [{}] ({}); existing session kept",
                                                     result.peer_cert.body.meta.name,
+                                                    peer_ip,
                                                     src
                                                 );
                                             }
@@ -911,6 +970,25 @@ fn main() -> anyhow::Result<()> {
                                         continue;
                                     }
                                     peer.last_seen = unix_now_secs();
+                                    if peer.addr != src {
+                                        let old_addr = peer.addr;
+                                        peer.addr = src;
+                                        let peer_ip = primary_cert_ip(&peer.cert)
+                                            .map(|ip| ip.to_string())
+                                            .unwrap_or_else(|| "?".to_string());
+                                        log::info!(
+                                            "peer {} [{}] ({}) roaming address updated: {} -> {}",
+                                            peer.name,
+                                            peer_ip,
+                                            peer_id,
+                                            old_addr,
+                                            src
+                                        );
+                                        if let Ok(mut est) = established_recv.lock() {
+                                            est.remove(&old_addr);
+                                            est.insert(src);
+                                        }
+                                    }
                                     Some((peer_id, body))
                                 } else {
                                     None
@@ -1338,23 +1416,30 @@ fn main() -> anyhow::Result<()> {
                                 Some((peer_id, PacketBody::Disconnect { .. })) => {
                                     let peer_info = if let Ok(p) = peers_recv.lock() {
                                         p.get(&peer_id).map(|s| {
-                                            (s.name.clone(), s.routes.clone(), s.rx_session_id)
+                                            let peer_ip = primary_cert_ip(&s.cert)
+                                                .map(|ip| ip.to_string())
+                                                .unwrap_or_else(|| "?".to_string());
+                                            (s.name.clone(), peer_ip, s.routes.clone(), s.rx_session_id)
                                         })
                                     } else {
                                         None
                                     };
                                     log::info!(
-                                        "peer {} ({}) disconnected",
+                                        "peer {} [{}] ({}) disconnected",
                                         peer_info
                                             .as_ref()
-                                            .map(|(n, _, _)| n.as_str())
+                                            .map(|(n, _, _, _)| n.as_str())
                                             .unwrap_or("unknown"),
+                                        peer_info
+                                            .as_ref()
+                                            .map(|(_, ip, _, _)| ip.as_str())
+                                            .unwrap_or("?"),
                                         peer_id
                                     );
                                     if let Ok(mut p) = peers_recv.lock() {
                                         p.remove(&peer_id);
                                     }
-                                    if let Some((_, _, rx_session_id)) = peer_info.as_ref() {
+                                    if let Some((_, _, _, rx_session_id)) = peer_info.as_ref() {
                                         if let Ok(mut sessions) = rx_sessions_recv.lock() {
                                             sessions.remove(rx_session_id);
                                         }
@@ -1365,7 +1450,7 @@ fn main() -> anyhow::Result<()> {
                                     if let Ok(mut est) = established_recv.lock() {
                                         est.remove(&src);
                                     }
-                                    if let Some((_, routes, _)) = peer_info {
+                                    if let Some((_, _, routes, _)) = peer_info {
                                         if let Some(ref iface) = iface_name {
                                             for route in &routes {
                                                 let route = route.to_string();
@@ -1612,6 +1697,9 @@ fn request_lighthouse_discovery(
 fn send_lighthouse_keepalive(
     lighthouse: &ResolvedLighthouse,
     peers: &Arc<Mutex<HashMap<u32, PeerState>>>,
+    established: &Arc<Mutex<HashSet<SocketAddr>>>,
+    route_map: &Arc<Mutex<RouteTable>>,
+    rx_sessions: &Arc<Mutex<HashMap<u32, u32>>>,
     keepalive_pending: &Arc<Mutex<HashMap<u32, KeepalivePending>>>,
     sock: &std::net::UdpSocket,
     network_key: &[u8; 32],
@@ -1623,39 +1711,66 @@ fn send_lighthouse_keepalive(
     rand::rngs::ThreadRng::default().fill_bytes(&mut token_bytes);
     let token = u64::from_be_bytes(token_bytes);
 
+    let mut peer_to_remove: Option<(u32, u32, SocketAddr)> = None;
+
     let packet = if let Ok(mut peers) = peers.lock() {
         let Some((peer_id, peer)) = peers
             .iter_mut()
-            .find(|(_, peer)| peer.addr == lighthouse.address)
+            .find(|(_, peer)| peer.addr == lighthouse.address || peer.name == lighthouse.name)
         else {
             log::debug!("no connected lighthouse peer for {}", lighthouse.name);
+            if let Ok(mut est) = established.lock() {
+                est.remove(&lighthouse.address);
+            }
             return;
         };
+        let peer_id = *peer_id;
 
         if let Ok(mut pending) = keepalive_pending.lock() {
-            if let Some(old) = pending.get(peer_id) {
+            if let Some(old) = pending.get(&peer_id) {
                 if now.saturating_sub(old.sent_at) >= timeout_secs {
                     log::warn!(
-                        "lighthouse keepalive timeout via {} ({}) token {}",
+                        "lighthouse keepalive timeout via {} ({}) token {}; disconnecting for reconnection",
                         lighthouse.name,
                         lighthouse.address,
                         old.token
                     );
+                    peer_to_remove = Some((peer_id, peer.rx_session_id, peer.addr));
                 }
             }
-            pending.insert(
-                *peer_id,
-                KeepalivePending {
-                    token,
-                    sent_at: now,
-                },
-            );
+            if peer_to_remove.is_none() {
+                pending.insert(
+                    peer_id,
+                    KeepalivePending {
+                        token,
+                        sent_at: now,
+                    },
+                );
+            }
+        }
+
+        if let Some((remove_id, remove_rx_session, remove_addr)) = peer_to_remove {
+            peers.remove(&remove_id);
+            if let Ok(mut r) = route_map.lock() {
+                r.remove_peer(remove_id);
+            }
+            if let Ok(mut sessions) = rx_sessions.lock() {
+                sessions.remove(&remove_rx_session);
+            }
+            if let Ok(mut est) = established.lock() {
+                est.remove(&remove_addr);
+                est.remove(&lighthouse.address);
+            }
+            if let Ok(mut pending) = keepalive_pending.lock() {
+                pending.remove(&remove_id);
+            }
+            return;
         }
 
         peer.tx_seq = peer.tx_seq.wrapping_add(1);
         let pkt = packet::encrypt_keepalive_packet(
             peer.tx_seq,
-            *peer_id,
+            peer_id,
             peer.tx_session_id,
             token,
             network_key,
