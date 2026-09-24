@@ -10,7 +10,7 @@ pub mod hybrid_kem {
     use ml_kem::{Decapsulate, Encapsulate, KeyExport, TryKeyInit};
     use rand::rngs::ThreadRng;
     use rand_core::Rng;
-    use x25519_dalek::{EphemeralSecret, PublicKey as X25519Pk};
+    use x25519_dalek::{EphemeralSecret, PublicKey as X25519Pk, ReusableSecret};
     use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
     pub const X25519_PK_LEN: usize = 32;
@@ -56,16 +56,28 @@ pub mod hybrid_kem {
         (eph_sk, eph_pk, ml_kem_sk, ml_kem_pk)
     }
 
+    /// Like [`generate_ephemeral`], but the X25519 secret survives a key agreement.
+    ///
+    /// The initiator needs this: its handshake may be retransmitted and answered more
+    /// than once, so the secret has to outlive the first (possibly bogus) reply.
+    pub fn generate_reusable_ephemeral(
+    ) -> (ReusableSecret, X25519Pk, MlKemSecretKey, MlKemPublicKey) {
+        let eph_sk = ReusableSecret::random_from_rng(&mut ThreadRng::default());
+        let eph_pk = X25519Pk::from(&eph_sk);
+        let (_ml_kem_seed, ml_kem_sk, ml_kem_pk) = generate_mlkem_keypair();
+        (eph_sk, eph_pk, ml_kem_sk, ml_kem_pk)
+    }
+
     pub fn encapsulate(
         peer_x25519: &[u8; X25519_PK_LEN],
         peer_mlkem: &[u8; MLKEM_PK_LEN],
-    ) -> (X25519Pk, [u8; HYBRID_SHARED_SECRET_LEN], [u8; MLKEM_CT_LEN]) {
+    ) -> Option<(X25519Pk, [u8; HYBRID_SHARED_SECRET_LEN], [u8; MLKEM_CT_LEN])> {
         let eph_sk = EphemeralSecret::random_from_rng(&mut ThreadRng::default());
         let eph_pk = X25519Pk::from(&eph_sk);
         let peer_pk = X25519Pk::from(*peer_x25519);
         let x25519_ss = eph_sk.diffie_hellman(&peer_pk);
 
-        let mlkem_pk = MlKemPublicKey::new_from_slice(peer_mlkem).unwrap();
+        let mlkem_pk = MlKemPublicKey::new_from_slice(peer_mlkem).ok()?;
         let (mlkem_ct, mlkem_ss) = mlkem_pk.encapsulate_with_rng(&mut ThreadRng::default());
 
         let mut combined = Zeroizing::new([0u8; HYBRID_SHARED_SECRET_LEN]);
@@ -74,7 +86,7 @@ pub mod hybrid_kem {
 
         let mut ct_bytes = [0u8; MLKEM_CT_LEN];
         ct_bytes.copy_from_slice(&mlkem_ct);
-        (eph_pk, *combined, ct_bytes)
+        Some((eph_pk, *combined, ct_bytes))
     }
 
     pub fn decapsulate(
@@ -82,18 +94,18 @@ pub mod hybrid_kem {
         peer_x25519: &[u8; X25519_PK_LEN],
         mlkem_sk_bytes: &[u8; MLKEM_SK_LEN],
         ct: &[u8; MLKEM_CT_LEN],
-    ) -> [u8; HYBRID_SHARED_SECRET_LEN] {
+    ) -> Option<[u8; HYBRID_SHARED_SECRET_LEN]> {
         let peer_pk = X25519Pk::from(*peer_x25519);
         let x25519_ss = x25519_sk.diffie_hellman(&peer_pk);
 
         let mlkem_sk = mlkem_sk_from_seed(mlkem_sk_bytes);
-        let mlkem_ct = ml_kem::ml_kem_768::Ciphertext::try_from(&ct[..]).unwrap();
+        let mlkem_ct = ml_kem::ml_kem_768::Ciphertext::try_from(&ct[..]).ok()?;
         let mlkem_ss = mlkem_sk.decapsulate(&mlkem_ct);
 
         let mut combined = Zeroizing::new([0u8; HYBRID_SHARED_SECRET_LEN]);
         combined[..32].copy_from_slice(x25519_ss.as_bytes());
         combined[32..].copy_from_slice(&mlkem_ss);
-        *combined
+        Some(*combined)
     }
 
     pub fn decapsulate_static(
@@ -101,20 +113,20 @@ pub mod hybrid_kem {
         peer_x25519: &[u8; X25519_PK_LEN],
         mlkem_sk_bytes: &[u8; MLKEM_SK_LEN],
         ct: &[u8; MLKEM_CT_LEN],
-    ) -> [u8; HYBRID_SHARED_SECRET_LEN] {
+    ) -> Option<[u8; HYBRID_SHARED_SECRET_LEN]> {
         use x25519_dalek::StaticSecret;
         let static_sk = StaticSecret::from(*x25519_sk_bytes);
         let peer_pk = X25519Pk::from(*peer_x25519);
         let x25519_ss = static_sk.diffie_hellman(&peer_pk);
 
         let mlkem_sk = mlkem_sk_from_seed(mlkem_sk_bytes);
-        let mlkem_ct = ml_kem::ml_kem_768::Ciphertext::try_from(&ct[..]).unwrap();
+        let mlkem_ct = ml_kem::ml_kem_768::Ciphertext::try_from(&ct[..]).ok()?;
         let mlkem_ss = mlkem_sk.decapsulate(&mlkem_ct);
 
         let mut combined = Zeroizing::new([0u8; HYBRID_SHARED_SECRET_LEN]);
         combined[..32].copy_from_slice(x25519_ss.as_bytes());
         combined[32..].copy_from_slice(&mlkem_ss);
-        *combined
+        Some(*combined)
     }
 
     pub fn mlkem_pk_bytes(pk: &MlKemPublicKey) -> [u8; MLKEM_PK_LEN] {
@@ -176,7 +188,7 @@ pub mod hybrid_sig {
     pub fn generate_hybrid_keypair() -> (HybridSigningKey, HybridVerifyKey) {
         let mut seed = Zeroizing::new([0u8; 32]);
         ThreadRng::default().fill_bytes(&mut *seed);
-        let ed_kp = ed25519_dalek::SigningKey::from_bytes(&*seed);
+        let ed_kp = ed25519_dalek::SigningKey::from_bytes(&seed);
         let ed_vk = ed_kp.verifying_key();
 
         let mut ml_dsa_seed = [0u8; MLDSA_SK_LEN];
@@ -190,7 +202,7 @@ pub mod hybrid_sig {
         };
         let vk = HybridVerifyKey {
             ed25519: ed_vk.to_bytes(),
-            ml_dsa: ml_dsa_pk.to_bytes().try_into().unwrap(),
+            ml_dsa: ml_dsa_pk.to_bytes().into(),
         };
         (sk, vk)
     }
@@ -204,7 +216,7 @@ pub mod hybrid_sig {
 
         HybridSignature {
             ed25519: ed_sig,
-            ml_dsa: ml_dsa_sig.to_bytes().try_into().unwrap(),
+            ml_dsa: ml_dsa_sig.to_bytes().into(),
         }
     }
 

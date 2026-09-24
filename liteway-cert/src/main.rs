@@ -179,11 +179,11 @@ fn main() -> anyhow::Result<()> {
                     }
                     println!(
                         "  Ed25519 PK: {}",
-                        hex::encode(&node_cert.body.keys.ed25519_pk)
+                        hex::encode(node_cert.body.keys.ed25519_pk)
                     );
                     println!(
                         "  ML-DSA PK: {}",
-                        hex::encode(&node_cert.body.keys.ml_dsa_pk)
+                        hex::encode(node_cert.body.keys.ml_dsa_pk)
                     );
                 }
                 Err(_) => {
@@ -192,8 +192,8 @@ fn main() -> anyhow::Result<()> {
                     println!("  Name: {}", ca.meta.name);
                     println!("  Groups: {:?}", ca.meta.groups);
                     println!("  Valid: {} -> {}", ca.meta.not_before, ca.meta.not_after);
-                    println!("  Ed25519 PK: {}", hex::encode(&ca.verify_key.ed25519));
-                    println!("  ML-DSA PK: {}", hex::encode(&ca.verify_key.ml_dsa));
+                    println!("  Ed25519 PK: {}", hex::encode(ca.verify_key.ed25519));
+                    println!("  ML-DSA PK: {}", hex::encode(ca.verify_key.ml_dsa));
                 }
             }
         }
@@ -248,28 +248,6 @@ fn generate_network_secret() -> String {
     hex::encode(seed)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::validate_node_ip_cidr;
-
-    #[test]
-    fn node_ip_requires_cidr_prefix() {
-        assert!(validate_node_ip_cidr("10.0.0.1").is_err());
-    }
-
-    #[test]
-    fn node_ip_rejects_host_only_prefix() {
-        assert!(validate_node_ip_cidr("10.0.0.1/32").is_err());
-        assert!(validate_node_ip_cidr("fd00::1/128").is_err());
-    }
-
-    #[test]
-    fn node_ip_accepts_mesh_prefix() {
-        validate_node_ip_cidr("10.0.0.1/24").unwrap();
-        validate_node_ip_cidr("fd00::1/64").unwrap();
-    }
-}
-
 fn write_private_file(path: impl AsRef<Path>, bytes: &[u8]) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
@@ -294,5 +272,27 @@ fn write_private_file(path: impl AsRef<Path>, bytes: &[u8]) -> anyhow::Result<()
         file.write_all(bytes)?;
         file.sync_all()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_node_ip_cidr;
+
+    #[test]
+    fn node_ip_requires_cidr_prefix() {
+        assert!(validate_node_ip_cidr("10.0.0.1").is_err());
+    }
+
+    #[test]
+    fn node_ip_rejects_host_only_prefix() {
+        assert!(validate_node_ip_cidr("10.0.0.1/32").is_err());
+        assert!(validate_node_ip_cidr("fd00::1/128").is_err());
+    }
+
+    #[test]
+    fn node_ip_accepts_mesh_prefix() {
+        validate_node_ip_cidr("10.0.0.1/24").unwrap();
+        validate_node_ip_cidr("fd00::1/64").unwrap();
     }
 }

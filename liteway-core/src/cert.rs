@@ -106,6 +106,16 @@ pub struct NodeSigningSecretKey {
     pub ml_dsa_seed: [u8; hybrid_sig::MLDSA_SK_LEN],
 }
 
+impl NodeSigningSecretKey {
+    /// Public half of the Ed25519 key, for checking that a key file and a
+    /// certificate belong together before the daemon starts signing with them.
+    pub fn ed25519_public(&self) -> [u8; hybrid_sig::ED25519_PK_LEN] {
+        ed25519_dalek::SigningKey::from_bytes(&self.ed25519)
+            .verifying_key()
+            .to_bytes()
+    }
+}
+
 impl CertBody {
     pub fn to_bytes(&self) -> Vec<u8> {
         serde_json::to_vec(self).unwrap()

@@ -66,7 +66,9 @@ pub enum PacketBody {
         target_ip: IpAddr,
         peer_id: u32,
         peer_addr: SocketAddr,
-        peer_cert: Cert,
+        /// Boxed: an inline certificate is ~5 KiB of ML-DSA material, and every
+        /// decrypted packet - data packets included - would carry that size.
+        peer_cert: Box<Cert>,
         peer_is_relay: bool,
     },
     LighthouseNotFound {
@@ -176,6 +178,9 @@ pub fn encrypt_lighthouse_query_packet(
     )
 }
 
+/// The lighthouse answer carries the peer's whole certificate, so it needs every
+/// one of these fields.
+#[allow(clippy::too_many_arguments)]
 pub fn encrypt_lighthouse_response_packet(
     seq: u64,
     dst_peer_id: u32,
@@ -295,7 +300,7 @@ pub fn decrypt_packet(
         session_key,
     ));
     let aad = packet_aad(&pkt);
-    let plaintext = aead::decrypt(&*packet_key, &pkt.nonce, &pkt.ciphertext, &aad)?;
+    let plaintext = aead::decrypt(&packet_key, &pkt.nonce, &pkt.ciphertext, &aad)?;
     let mut rd = Reader::new(&plaintext);
     let kind = rd.u8()?;
     let seq = rd.u64()?;
@@ -328,7 +333,7 @@ pub fn decrypt_packet(
             let target_ip = parse_utf8(rd.vec_u32()?)?.parse().ok()?;
             let peer_id = rd.u32()?;
             let peer_addr = parse_utf8(rd.vec_u32()?)?.parse().ok()?;
-            let peer_cert = serde_json::from_slice(rd.vec_u32()?).ok()?;
+            let peer_cert = Box::new(serde_json::from_slice(rd.vec_u32()?).ok()?);
             let peer_is_relay = rd.u8()? != 0;
             Some((
                 header,
@@ -388,9 +393,21 @@ pub fn deserialize_packet(data: &[u8]) -> Option<DataPacket> {
     })
 }
 
+/// Read the masked header straight off the wire.
+///
+/// Every datagram passes through here, including ones that turn out to be junk,
+/// so it must not copy the payload: building a whole `DataPacket` first made each
+/// received packet allocate a copy of itself before it was even recognised.
 pub fn network_header(data: &[u8], network_key: &[u8; K_HEADER_LEN]) -> Option<NetworkHeader> {
-    let pkt = deserialize_packet(data)?;
-    unmask_header(&pkt, network_key)
+    if data.len() < MIN_PACKET_LEN {
+        return None;
+    }
+    let mask_nonce: &[u8; MASK_NONCE_LEN] = data[..MASK_NONCE_LEN].try_into().ok()?;
+    let masked: &[u8; NETWORK_HEADER_LEN] = data
+        [MASK_NONCE_LEN..MASK_NONCE_LEN + NETWORK_HEADER_LEN]
+        .try_into()
+        .ok()?;
+    unmask_header_bytes(mask_nonce, masked, network_key)
 }
 
 pub fn derive_traffic_key(
@@ -436,7 +453,7 @@ fn seal(
         "liteway-packet-key-v2",
         session_key,
     ));
-    let ciphertext = aead::encrypt(&*packet_key, &nonce, plaintext, &aad);
+    let ciphertext = aead::encrypt(&packet_key, &nonce, plaintext, &aad);
     DataPacket {
         mask_nonce,
         masked_header,
@@ -506,13 +523,29 @@ fn decode_header(bytes: [u8; NETWORK_HEADER_LEN]) -> Option<NetworkHeader> {
     })
 }
 
+/// Header of an already deserialized packet, without re-reading the wire bytes.
+pub fn unmask_packet_header(
+    pkt: &DataPacket,
+    network_key: &[u8; K_HEADER_LEN],
+) -> Option<NetworkHeader> {
+    unmask_header(pkt, network_key)
+}
+
 fn unmask_header(pkt: &DataPacket, network_key: &[u8; K_HEADER_LEN]) -> Option<NetworkHeader> {
+    unmask_header_bytes(&pkt.mask_nonce, &pkt.masked_header, network_key)
+}
+
+fn unmask_header_bytes(
+    mask_nonce: &[u8; MASK_NONCE_LEN],
+    masked_header: &[u8; NETWORK_HEADER_LEN],
+    network_key: &[u8; K_HEADER_LEN],
+) -> Option<NetworkHeader> {
     let mask_key = kdf::derive_labeled_key("liteway-network-header-mask-v1", network_key);
-    let mask = blake3::keyed_hash(&mask_key, &pkt.mask_nonce);
+    let mask = blake3::keyed_hash(&mask_key, mask_nonce);
     let mut plain = [0u8; NETWORK_HEADER_LEN];
     for (out, (masked, mask)) in plain
         .iter_mut()
-        .zip(pkt.masked_header.iter().zip(mask.as_bytes().iter()))
+        .zip(masked_header.iter().zip(mask.as_bytes().iter()))
     {
         *out = *masked ^ *mask;
     }

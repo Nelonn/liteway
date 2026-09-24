@@ -6,12 +6,14 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LighthouseConfig {
     pub name: String,
     pub address: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InterfaceConfig {
     pub name: String,
     #[serde(default = "default_mtu")]
@@ -36,6 +38,7 @@ impl Default for InterfaceConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AppConfig {
     #[serde(default = "default_listen")]
     pub listen: SocketAddr,
@@ -66,6 +69,18 @@ pub struct AppConfig {
 
     #[serde(default = "default_relay_fallback_timeout")]
     pub relay_fallback_timeout_secs: u64,
+
+    /// How long a handshake keeps being retransmitted before it is abandoned.
+    #[serde(default = "default_handshake_timeout")]
+    pub handshake_timeout_secs: u64,
+
+    /// Interval between keepalives on an idle session; also keeps NAT mappings open.
+    #[serde(default = "default_keepalive_interval")]
+    pub keepalive_interval_secs: u64,
+
+    /// Interval between hole-punch probes sent to a relayed peer's direct endpoint.
+    #[serde(default = "default_direct_probe_interval")]
+    pub direct_probe_interval_secs: u64,
 }
 
 fn default_punch_interval() -> u64 {
@@ -84,13 +99,82 @@ fn default_relay_fallback_timeout() -> u64 {
     5
 }
 
+fn default_handshake_timeout() -> u64 {
+    20
+}
+
+fn default_keepalive_interval() -> u64 {
+    10
+}
+
+fn default_direct_probe_interval() -> u64 {
+    5
+}
+
 impl AppConfig {
     pub fn from_file(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path.as_ref();
         let content = fs::read_to_string(path)
             .with_context(|| format!("read config file '{}'", path.display()))?;
-        Ok(toml::from_str(&content)
-            .with_context(|| format!("parse config file '{}'", path.display()))?)
+        toml::from_str(&content).with_context(|| format!("parse config file '{}'", path.display()))
+    }
+
+    /// Reject values that would silently disable a subsystem or spin a timer thread.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let zero_checks = [
+            ("punch_interval_secs", self.punch_interval_secs),
+            ("keepalive_timeout_secs", self.keepalive_timeout_secs),
+            ("keepalive_interval_secs", self.keepalive_interval_secs),
+            ("handshake_timeout_secs", self.handshake_timeout_secs),
+            (
+                "direct_probe_interval_secs",
+                self.direct_probe_interval_secs,
+            ),
+            (
+                "relay_fallback_timeout_secs",
+                self.relay_fallback_timeout_secs,
+            ),
+        ];
+        for (name, value) in zero_checks {
+            if value == 0 {
+                anyhow::bail!("{name} must be greater than 0");
+            }
+        }
+
+        if self.keepalive_timeout_secs <= self.keepalive_interval_secs {
+            anyhow::bail!(
+                "keepalive_timeout_secs ({}) must be greater than keepalive_interval_secs ({}), \
+                 otherwise every session is torn down before its keepalive can be answered",
+                self.keepalive_timeout_secs,
+                self.keepalive_interval_secs
+            );
+        }
+
+        if self.relay_fallback_timeout_secs >= self.handshake_timeout_secs {
+            anyhow::bail!(
+                "relay_fallback_timeout_secs ({}) must be smaller than handshake_timeout_secs ({}), \
+                 otherwise the relay is never tried",
+                self.relay_fallback_timeout_secs,
+                self.handshake_timeout_secs
+            );
+        }
+
+        if let Some(iface) = self.interface.as_ref() {
+            if iface.mtu < 576 {
+                anyhow::bail!(
+                    "interface.mtu {} is below the IPv4 minimum of 576",
+                    iface.mtu
+                );
+            }
+        }
+
+        for lighthouse in &self.lighthouses {
+            if lighthouse.address.trim().is_empty() {
+                anyhow::bail!("lighthouse '{}' has an empty address", lighthouse.name);
+            }
+        }
+
+        Ok(())
     }
 
     pub fn network_secret(&self) -> anyhow::Result<[u8; 32]> {

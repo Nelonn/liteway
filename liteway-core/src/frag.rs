@@ -51,6 +51,33 @@ pub fn send_fragmented_to_peer(
     max_datagram: usize,
     dst_peer_id: u32,
 ) -> io::Result<()> {
+    send_fragmented_with_id(
+        sock,
+        data,
+        addr,
+        network_key,
+        max_datagram,
+        dst_peer_id,
+        rand::random(),
+    )
+}
+
+/// Send with a caller-chosen message id.
+///
+/// Retransmissions of the same message must reuse their id: the receiver then
+/// merges the copies into one pending message, so a fragment only has to survive
+/// *one* of the attempts. With a fresh id per attempt every retry starts from
+/// zero, and a 14-fragment handshake needs a completely lossless round to ever
+/// finish.
+pub fn send_fragmented_with_id(
+    sock: &UdpSocket,
+    data: &[u8],
+    addr: SocketAddr,
+    network_key: &[u8; K_HEADER_LEN],
+    max_datagram: usize,
+    dst_peer_id: u32,
+    msg_id: u32,
+) -> io::Result<()> {
     if max_datagram < MIN_DATAGRAM {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -66,8 +93,6 @@ pub fn send_fragmented_to_peer(
             "fragmented message exceeds 255 chunks",
         ));
     }
-    let msg_id: u32 = rand::random();
-
     if data.is_empty() {
         let mut plain = Vec::with_capacity(7);
         plain.push(KIND_HANDSHAKE_FRAG);
@@ -221,10 +246,8 @@ impl FragmentAssembler {
             self.buffered_bytes = self.buffered_bytes.saturating_sub(entry.bytes);
 
             let mut assembled = Vec::new();
-            for slot in entry.chunks.drain(..) {
-                if let Some(data) = slot {
-                    assembled.extend_from_slice(&data);
-                }
+            for data in entry.chunks.drain(..).flatten() {
+                assembled.extend_from_slice(&data);
             }
             return FeedResult::Complete(assembled);
         }
