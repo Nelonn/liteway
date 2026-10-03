@@ -19,8 +19,10 @@ fn test_network_secret() -> [u8; 32] {
 #[test]
 fn hybrid_kem_roundtrip() {
     let (sk, pk) = hybrid_kem::generate_hybrid_keypair();
-    let (eph_pk, ss1, ct) = hybrid_kem::encapsulate(&pk.x25519, &pk.ml_kem);
-    let ss2 = hybrid_kem::decapsulate_static(&sk.x25519, &eph_pk.to_bytes(), &sk.ml_kem, &ct);
+    let (eph_pk, ss1, ct) =
+        hybrid_kem::encapsulate(&pk.x25519, &pk.ml_kem).expect("encapsulation must succeed");
+    let ss2 = hybrid_kem::decapsulate_static(&sk.x25519, &eph_pk.to_bytes(), &sk.ml_kem, &ct)
+        .expect("decapsulation must succeed");
     assert_eq!(ss1, ss2, "shared secrets must match");
 }
 
@@ -33,7 +35,8 @@ fn hybrid_kem_ephemeral_roundtrip() {
     let peer_k_pk = hybrid_kem::mlkem_pk_bytes(&eph_k_pk);
     let pk_x: [u8; 32] = peer_x_pk;
     let pk_k: [u8; hybrid_kem::MLKEM_PK_LEN] = peer_k_pk;
-    let (resp_eph_pk, ss1, ct) = hybrid_kem::encapsulate(&pk_x, &pk_k);
+    let (resp_eph_pk, ss1, ct) =
+        hybrid_kem::encapsulate(&pk_x, &pk_k).expect("encapsulation must succeed");
 
     // initiator decapsulates using responder's ephemeral public key
     let ct_bytes: [u8; hybrid_kem::MLKEM_CT_LEN] = ct;
@@ -41,9 +44,10 @@ fn hybrid_kem_ephemeral_roundtrip() {
     let ss2 = hybrid_kem::decapsulate(
         eph_sk,
         &resp_pk_x,
-        &eph_k_sk.to_seed().unwrap().try_into().unwrap(),
+        &eph_k_sk.to_seed().unwrap().into(),
         &ct_bytes,
-    );
+    )
+    .expect("decapsulation must succeed");
     assert_eq!(ss1, ss2, "ephemeral shared secrets must match");
 }
 
@@ -438,7 +442,7 @@ fn lighthouse_response_packet_roundtrip() {
             target_ip,
             peer_id: 0x01020304,
             peer_addr,
-            peer_cert: node.cert,
+            peer_cert: Box::new(node.cert),
             peer_is_relay: false,
         }
     );
@@ -581,6 +585,9 @@ fn app_config_with_secret(network_secret: &str) -> AppConfig {
         keepalive_punch: true,
         keepalive_timeout_secs: 30,
         relay_fallback_timeout_secs: 5,
+        handshake_timeout_secs: 20,
+        keepalive_interval_secs: 10,
+        direct_probe_interval_secs: 5,
     }
 }
 
@@ -690,7 +697,7 @@ fn handshake_full_roundtrip() {
     );
 
     // Alice processes handshake 2
-    let result = handshake::process_handshake_2(&resp.msg, init, &network_key, &ca_vk)
+    let result = handshake::process_handshake_2(&resp.msg, &init, &network_key, &ca_vk)
         .expect("handshake 2 must succeed");
 
     assert_eq!(
@@ -706,6 +713,103 @@ fn handshake_full_roundtrip() {
         resp.session_key.len(),
         SESSION_KEY_LEN,
         "session key must be correct length"
+    );
+}
+
+#[test]
+fn repeated_handshake_1_derives_a_different_session() {
+    // Why litewayd caches its handshake_2 responses: answering a retransmitted
+    // handshake_1 a second time silently replaces the responder's session key,
+    // while the initiator keeps whichever answer reached it first.
+    let (ca_sk, ca_vk, network_secret) = make_ca();
+    let network_key = kdf::derive_network_key(&network_secret);
+    let alice = make_node("alice", "10.0.0.1/24", &ca_sk);
+    let bob = make_node("bob", "10.0.0.2/24", &ca_sk);
+
+    let init =
+        handshake::create_handshake_1(&alice.cert, &alice.signing_secret_key, &network_key, false);
+    let first = handshake::process_handshake_1(
+        &init.msg,
+        &bob.cert,
+        &bob.signing_secret_key,
+        &network_key,
+        &ca_vk,
+        false,
+    )
+    .expect("first handshake_1 must succeed");
+    let second = handshake::process_handshake_1(
+        &init.msg,
+        &bob.cert,
+        &bob.signing_secret_key,
+        &network_key,
+        &ca_vk,
+        false,
+    )
+    .expect("repeated handshake_1 must still parse");
+
+    assert_ne!(
+        first.session_key, second.session_key,
+        "processing the same handshake_1 twice must not be treated as idempotent"
+    );
+
+    let result = handshake::process_handshake_2(&first.msg, &init, &network_key, &ca_vk)
+        .expect("handshake 2 must succeed");
+    assert_eq!(
+        result.session_key, first.session_key,
+        "the initiator keeps the answer it processed"
+    );
+}
+
+#[test]
+fn a_bogus_handshake_2_does_not_consume_the_initiator_state() {
+    // A forged or corrupted reply must not be able to cancel a handshake in
+    // flight: the genuine answer still has to work afterwards.
+    let (ca_sk, ca_vk, network_secret) = make_ca();
+    let network_key = kdf::derive_network_key(&network_secret);
+    let alice = make_node("alice", "10.0.0.1/24", &ca_sk);
+    let bob = make_node("bob", "10.0.0.2/24", &ca_sk);
+
+    let init =
+        handshake::create_handshake_1(&alice.cert, &alice.signing_secret_key, &network_key, false);
+    let resp = handshake::process_handshake_1(
+        &init.msg,
+        &bob.cert,
+        &bob.signing_secret_key,
+        &network_key,
+        &ca_vk,
+        false,
+    )
+    .expect("handshake 1 must succeed");
+
+    let mut forged = resp.msg.clone();
+    let last = forged.len() - 1;
+    forged[last] ^= 0xff;
+    assert!(
+        handshake::process_handshake_2(&forged, &init, &network_key, &ca_vk).is_err(),
+        "forged handshake_2 must be rejected"
+    );
+
+    let result = handshake::process_handshake_2(&resp.msg, &init, &network_key, &ca_vk)
+        .expect("genuine handshake_2 must still succeed after a forged one");
+    assert_eq!(result.session_key, resp.session_key);
+}
+
+#[test]
+fn handshake_retransmission_is_byte_identical() {
+    // Retransmission resends the same bytes, so the transcript hash the responder
+    // binds its answer to stays valid.
+    let (ca_sk, _ca_vk, network_secret) = make_ca();
+    let network_key = kdf::derive_network_key(&network_secret);
+    let alice = make_node("alice", "10.0.0.1/24", &ca_sk);
+
+    let init =
+        handshake::create_handshake_1(&alice.cert, &alice.signing_secret_key, &network_key, false);
+    assert_eq!(init.msg, init.msg.clone());
+    assert_ne!(
+        init.msg,
+        handshake::create_handshake_1(&alice.cert, &alice.signing_secret_key, &network_key, false)
+            .msg,
+        "a fresh handshake must not reuse the previous one's ephemeral material"
     );
 }
 
@@ -927,7 +1031,7 @@ fn handshake_2_wrong_signing_key_fails() {
     .expect("handshake_1 processing itself should succeed");
 
     assert!(
-        handshake::process_handshake_2(&resp.msg, init, &network_key, &ca_vk).is_err(),
+        handshake::process_handshake_2(&resp.msg, &init, &network_key, &ca_vk).is_err(),
         "handshake_2 signed by a key outside Bob cert must fail"
     );
 }
@@ -976,14 +1080,14 @@ fn handshake_2_tampering_fails() {
         };
         tampered[idx] ^= 0xff;
         assert!(
-            handshake::process_handshake_2(&tampered, init_for_tamper, &network_key, &ca_vk)
+            handshake::process_handshake_2(&tampered, &init_for_tamper, &network_key, &ca_vk)
                 .is_err(),
             "tampered handshake_2 byte {idx} must fail"
         );
     }
 
     assert!(
-        handshake::process_handshake_2(&resp.msg, init, &network_key, &ca_vk).is_ok(),
+        handshake::process_handshake_2(&resp.msg, &init, &network_key, &ca_vk).is_ok(),
         "untampered control handshake should still succeed"
     );
 }
@@ -1253,7 +1357,7 @@ fn udp_handshake(
     resp_sock.send_to(&resp.msg, src).unwrap();
 
     let (len, _) = recv_full(init_sock, &mut buf);
-    let result = handshake::process_handshake_2(&buf[..len], init, network_key, ca_vk)
+    let result = handshake::process_handshake_2(&buf[..len], &init, network_key, ca_vk)
         .expect("handshake 2 must succeed");
     let alice_session = result.session_key;
 

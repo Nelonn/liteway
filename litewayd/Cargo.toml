@@ -15,6 +15,7 @@ toml.workspace = true
 serde.workspace = true
 blake3.workspace = true
 ipnetwork.workspace = true
+chrono.workspace = true
 zeroize.workspace = true
 rand.workspace = true
 ctrlc = "3.4"

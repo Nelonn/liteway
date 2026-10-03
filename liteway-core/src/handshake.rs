@@ -1,7 +1,7 @@
 use ml_kem::{Decapsulate, Encapsulate, TryKeyInit};
 use rand::rngs::ThreadRng;
 use rand_core::Rng;
-use x25519_dalek::{EphemeralSecret, PublicKey as X25519Pk};
+use x25519_dalek::{PublicKey as X25519Pk, ReusableSecret};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::cert::{CaVerifyKey, Cert, NodeSigningSecretKey};
@@ -34,9 +34,14 @@ impl Drop for HandshakeResult {
     }
 }
 
+/// Initiator state for an in-flight handshake.
+///
+/// The secrets are reusable so that the same `msg` can be retransmitted and every
+/// arriving handshake_2 can be tried: a forged or corrupt reply must not consume
+/// the state that a later genuine reply needs.
 pub struct HandshakeInitiate {
     pub msg: Vec<u8>,
-    pub eph_x25519_sk: EphemeralSecret,
+    pub eph_x25519_sk: ReusableSecret,
     pub eph_mlkem_sk: hybrid_kem::MlKemSecretKey,
     pub my_rx_session_id: u32,
 }
@@ -78,7 +83,7 @@ pub fn create_handshake_1(
     network_key: &[u8; K_HEADER_LEN],
     relay_flag: bool,
 ) -> HandshakeInitiate {
-    let (eph_x_sk, eph_x_pk, eph_k_sk, eph_k_pk) = hybrid_kem::generate_ephemeral();
+    let (eph_x_sk, eph_x_pk, eph_k_sk, eph_k_pk) = hybrid_kem::generate_reusable_ephemeral();
     let my_rx_session_id = random_session_id();
 
     let flags = if relay_flag { FLAG_RELAY } else { 0 };
@@ -161,7 +166,7 @@ pub fn process_handshake_1(
     add_random_padding(&mut plaintext2);
 
     let msg = seal_handshake_with_header(network_key, &plaintext2, 0, hs1.rx_session_id);
-    let session_key = derive_session_v2(&*hybrid_ss, data, &msg);
+    let session_key = derive_session_v2(&hybrid_ss, data, &msg);
 
     Ok(HandshakeResponse {
         msg,
@@ -175,7 +180,7 @@ pub fn process_handshake_1(
 
 pub fn process_handshake_2(
     data: &[u8],
-    initiate: HandshakeInitiate,
+    initiate: &HandshakeInitiate,
     network_key: &[u8; K_HEADER_LEN],
     ca_vk: &CaVerifyKey,
 ) -> anyhow::Result<HandshakeResult> {
@@ -194,7 +199,7 @@ pub fn process_handshake_2(
     hybrid_ss[..32].copy_from_slice(x25519_ss.as_bytes());
     hybrid_ss[32..].copy_from_slice(&mlkem_ss);
 
-    let session_key = derive_session_v2(&*hybrid_ss, &initiate.msg, data);
+    let session_key = derive_session_v2(&hybrid_ss, &initiate.msg, data);
 
     Ok(HandshakeResult {
         peer_cert: hs2.cert,
@@ -252,7 +257,7 @@ fn seal_handshake_with_header(
 
 pub(crate) fn open_handshake(network_key: &[u8; K_HEADER_LEN], data: &[u8]) -> Option<Vec<u8>> {
     let pkt = packet::deserialize_packet(data)?;
-    let header = packet::network_header(data, network_key)?;
+    let header = packet::unmask_packet_header(&pkt, network_key)?;
     let aad = packet::packet_aad(&pkt);
     let plaintext = aead::decrypt(network_key, &pkt.nonce, &pkt.ciphertext, &aad)?;
     if header.kind == KIND_HANDSHAKE_FRAG {

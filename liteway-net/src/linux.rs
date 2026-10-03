@@ -8,21 +8,16 @@ use netlink_packet_route::route::{
 use netlink_packet_route::AddressFamily;
 use tokio::runtime::Builder;
 
-fn get_iface_index<'a>(
-    handle: &'a rtnetlink::Handle,
-    name: &'a str,
-) -> impl std::future::Future<Output = io::Result<u32>> + 'a {
-    async move {
-        let mut links = handle.link().get().match_name(name.to_string()).execute();
+async fn get_iface_index<'a>(handle: &'a rtnetlink::Handle, name: &'a str) -> io::Result<u32> {
+    let mut links = handle.link().get().match_name(name.to_string()).execute();
 
-        let link = links
-            .try_next()
-            .await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "interface not found"))?;
+    let link = links
+        .try_next()
+        .await
+        .map_err(io::Error::other)?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "interface not found"))?;
 
-        Ok(link.header.index)
-    }
+    Ok(link.header.index)
 }
 
 fn with_rtnetlink<F, T>(f: F) -> io::Result<T>
@@ -37,8 +32,7 @@ pub fn set_interface_ip(name: &str, addr: &str) -> io::Result<()> {
     let (ip, prefix_len) = super::parse_addr(addr)?;
 
     with_rtnetlink(async {
-        let (connection, handle, _) =
-            rtnetlink::new_connection().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let (connection, handle, _) = rtnetlink::new_connection().map_err(io::Error::other)?;
 
         tokio::spawn(connection);
 
@@ -50,14 +44,14 @@ pub fn set_interface_ip(name: &str, addr: &str) -> io::Result<()> {
             .up()
             .execute()
             .await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
 
         handle
             .address()
             .add(iface_idx, ip, prefix_len)
             .execute()
             .await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
 
         Ok(())
     })
@@ -101,8 +95,7 @@ pub fn add_route(subnet: &str, iface: &str) -> io::Result<()> {
     let (ip, prefix_len) = parse_subnet(subnet)?;
 
     with_rtnetlink(async {
-        let (connection, handle, _) =
-            rtnetlink::new_connection().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let (connection, handle, _) = rtnetlink::new_connection().map_err(io::Error::other)?;
 
         tokio::spawn(connection);
 
@@ -136,7 +129,7 @@ pub fn add_route(subnet: &str, iface: &str) -> io::Result<()> {
             if msg.contains("File exists") || msg.contains("os error 17") {
                 Ok(())
             } else {
-                Err(io::Error::new(io::ErrorKind::Other, e))
+                Err(io::Error::other(e))
             }
         })
     })
@@ -144,8 +137,7 @@ pub fn add_route(subnet: &str, iface: &str) -> io::Result<()> {
 
 pub fn del_route(subnet: &str, iface: &str) -> io::Result<()> {
     with_rtnetlink(async {
-        let (connection, handle, _) =
-            rtnetlink::new_connection().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let (connection, handle, _) = rtnetlink::new_connection().map_err(io::Error::other)?;
 
         tokio::spawn(connection);
 
@@ -157,6 +149,6 @@ pub fn del_route(subnet: &str, iface: &str) -> io::Result<()> {
             .del(msg)
             .execute()
             .await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+            .map_err(io::Error::other)
     })
 }
