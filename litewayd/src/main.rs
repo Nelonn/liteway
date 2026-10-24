@@ -23,8 +23,8 @@ use rand::Rng;
 use zeroize::{Zeroize, Zeroizing};
 
 use state::{
-    accept_handshake_session, DropReason, HandshakeCache, LighthouseSlot, PathProbe, PeerState,
-    PeerTick, PendingHandshake, ReplayWindow, RouteTable, Timings,
+    accept_handshake_session, DropReason, HandshakeCache, KeepaliveAck, LighthouseSlot, PathProbe,
+    PeerState, PeerTick, PendingHandshake, ReplayWindow, RouteTable, Timings,
 };
 
 const DISCOVERY_RETRY: Duration = Duration::from_secs(10);
@@ -558,6 +558,7 @@ impl Node {
                     tx_seq: 0,
                     rx_replay: ReplayWindow::new(),
                     last_seen: now,
+                    last_ack: now,
                     routes: routes.clone(),
                     handshake_initiator_id: initiator_id,
                     keepalive: None,
@@ -1358,6 +1359,12 @@ impl Node {
             let Ok(mut peers) = self.peers.lock() else {
                 return;
             };
+            // Checked here rather than through addr_is_relay: the peers lock is
+            // already held, and a relay must not count as a relay for itself.
+            let src_is_relay = peers.get(&peer_id).is_some_and(|peer| peer.addr != src)
+                && peers
+                    .iter()
+                    .any(|(id, other)| *id != peer_id && other.is_relay && other.addr == src);
             let Some(peer) = peers.get_mut(&peer_id) else {
                 log::debug!(
                     "rx session {} points to missing peer {}",
@@ -1381,11 +1388,14 @@ impl Node {
                 return;
             }
 
-            if let Some(old_addr) = peer.mark_seen(src, Instant::now()) {
+            let was_relayed = peer.relayed;
+            let is_keepalive = matches!(body, PacketBody::Keepalive { .. });
+            if let Some(old_addr) = peer.mark_seen(src, Instant::now(), src_is_relay, is_keepalive)
+            {
                 let peer_ip = primary_cert_ip(&peer.cert)
                     .map(|ip| ip.to_string())
                     .unwrap_or_else(|| "?".to_string());
-                if peer.direct_addr == Some(src) {
+                if was_relayed && !peer.relayed {
                     log::info!(
                         "peer {} [{}] ({}) moved off the relay: {} -> {}",
                         peer.name,
@@ -1430,7 +1440,7 @@ impl Node {
             PacketBody::LighthouseNotFound { target_ip, .. } => {
                 log::info!("lighthouse has no peer for {}", target_ip)
             }
-            PacketBody::Keepalive { token, .. } => self.answer_keepalive(peer_id, token),
+            PacketBody::Keepalive { token, .. } => self.answer_keepalive(peer_id, token, src),
             PacketBody::KeepaliveAck { token, .. } => self.handle_keepalive_ack(peer_id, token),
             PacketBody::RelayForward {
                 next_peer_id,
@@ -1726,7 +1736,10 @@ impl Node {
         );
     }
 
-    fn answer_keepalive(&self, peer_id: u32, token: u64) {
+    /// Acks go back to where the keepalive came from, not to the session's
+    /// current endpoint: answering a hole punch on the path it arrived on is what
+    /// proves that path to the peer.
+    fn answer_keepalive(&self, peer_id: u32, token: u64, reply_to: SocketAddr) {
         let Some(tx) = self.peer_tx(peer_id) else {
             return;
         };
@@ -1738,7 +1751,7 @@ impl Node {
             &self.network_key,
             &tx.key,
         );
-        self.send_wire(&packet::serialize_packet(&pkt), tx.addr, "keepalive ack");
+        self.send_wire(&packet::serialize_packet(&pkt), reply_to, "keepalive ack");
     }
 
     fn handle_keepalive_ack(&self, peer_id: u32, token: u64) {
@@ -1748,16 +1761,18 @@ impl Node {
         let Some(peer) = peers.get_mut(&peer_id) else {
             return;
         };
-        if peer.ack_keepalive(token) {
-            log::debug!("keepalive ack from {} ({})", peer.name, peer_id);
-        } else if peer.probe_token == Some(token) {
-            log::debug!(
+        match peer.ack_keepalive(token, Instant::now()) {
+            KeepaliveAck::Keepalive => {
+                log::debug!("keepalive ack from {} ({})", peer.name, peer_id)
+            }
+            KeepaliveAck::Probe => log::debug!(
                 "direct path probe acknowledged by {} ({})",
                 peer.name,
                 peer_id
-            );
-        } else {
-            log::debug!("unexpected keepalive ack from {} token {}", peer_id, token);
+            ),
+            KeepaliveAck::Unknown => {
+                log::debug!("unexpected keepalive ack from {} token {}", peer_id, token)
+            }
         }
     }
 

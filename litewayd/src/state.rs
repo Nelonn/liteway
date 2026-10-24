@@ -30,6 +30,10 @@ const HANDSHAKE_CACHE_MAX_ENTRIES: usize = 256;
 /// Probe backoff ceiling for peers whose direct path never opens up.
 const DIRECT_PROBE_MAX_INTERVAL: Duration = Duration::from_secs(30);
 
+/// How often an unanswered keepalive is repeated. Many short retries inside the
+/// timeout keep a lossy link from looking dead, without waiting a full interval.
+const KEEPALIVE_RETRY_MAX: Duration = Duration::from_secs(2);
+
 #[derive(Copy, Clone, Debug)]
 pub struct Timings {
     pub keepalive_interval: Duration,
@@ -192,7 +196,10 @@ pub struct PeerState {
     pub rx_session_id: u32,
     pub tx_seq: u64,
     pub rx_replay: ReplayWindow,
+    /// Last authenticated packet from the peer: proves only *their* direction.
     pub last_seen: Instant,
+    /// Last time the peer proved it receives what we send (an answered keepalive).
+    pub last_ack: Instant,
     pub routes: Vec<IpNetwork>,
     pub handshake_initiator_id: u32,
     pub keepalive: Option<KeepalivePending>,
@@ -221,14 +228,40 @@ impl PeerState {
     ///
     /// Liveness of *our* sending direction is proven by keepalive acks only, so a
     /// packet arriving here does not clear an outstanding keepalive.
-    pub fn mark_seen(&mut self, src: SocketAddr, now: Instant) -> Option<SocketAddr> {
+    ///
+    /// Only a path known to work both ways is adopted. A keepalive arriving on the
+    /// direct path while we are relayed is the peer's hole punch: it proves the
+    /// peer reaches us, not that we reach the peer, so it only becomes a probe
+    /// target and its ack (sent back to where it came from) proves the rest. And
+    /// a session that already went direct is not pulled back by late relayed
+    /// packets; switching back and forth is what made direct paths flap.
+    pub fn mark_seen(
+        &mut self,
+        src: SocketAddr,
+        now: Instant,
+        src_is_relay: bool,
+        is_keepalive: bool,
+    ) -> Option<SocketAddr> {
         self.last_seen = now;
         if self.addr == src {
             return None;
         }
+        if src_is_relay {
+            if !self.relayed {
+                return None;
+            }
+        } else if self.relayed && is_keepalive {
+            if self.direct_addr != Some(src) {
+                self.direct_addr = Some(src);
+                self.next_probe = None;
+            }
+            return None;
+        }
+
         let old = self.addr;
         self.addr = src;
-        if self.direct_addr == Some(src) {
+        if !src_is_relay {
+            self.direct_addr = Some(src);
             self.relayed = false;
             self.next_probe = None;
             self.probe_token = None;
@@ -236,12 +269,19 @@ impl PeerState {
         Some(old)
     }
 
-    pub fn ack_keepalive(&mut self, token: u64) -> bool {
+    /// Match an ack against the outstanding keepalive or direct path probe.
+    pub fn ack_keepalive(&mut self, token: u64, now: Instant) -> KeepaliveAck {
         if self.keepalive.as_ref().is_some_and(|k| k.token == token) {
             self.keepalive = None;
-            return true;
+            self.last_ack = now;
+            return KeepaliveAck::Keepalive;
         }
-        false
+        if self.probe_token == Some(token) {
+            self.probe_token = None;
+            self.last_ack = now;
+            return KeepaliveAck::Probe;
+        }
+        KeepaliveAck::Unknown
     }
 
     /// Decide what this peer needs on a maintenance tick.
@@ -249,17 +289,20 @@ impl PeerState {
     /// `token` is only consumed when a new keepalive is started; an unanswered one
     /// is repeated with its original token so a single lost datagram cannot cost
     /// the session.
+    ///
+    /// Keepalives are scheduled from the last *ack*, not from the last packet
+    /// received: traffic coming in says nothing about traffic going out. Keying
+    /// them off inbound traffic meant a peer that kept talking to us (a
+    /// lighthouse sending its own keepalives, introductions) suppressed our
+    /// probes entirely, and a session whose sending direction had died stayed
+    /// "connected" for as long as the other side kept sending.
     pub fn tick(&mut self, now: Instant, timings: &Timings, token: u64) -> PeerTick {
         if let Some(pending) = self.keepalive.as_mut() {
-            // Only a session that has gone quiet in *both* directions is dead. A
-            // peer whose acks keep getting lost on a lossy link is still talking,
-            // and tearing that session down would only add a re-handshake to it.
-            if now.duration_since(pending.first_sent_at) >= timings.keepalive_timeout
-                && now.duration_since(self.last_seen) >= timings.keepalive_timeout
-            {
+            if now.duration_since(pending.first_sent_at) >= timings.keepalive_timeout {
                 return PeerTick::Drop(DropReason::KeepaliveTimeout);
             }
-            if now.duration_since(pending.last_sent_at) >= timings.keepalive_interval {
+            let retry = timings.keepalive_interval.min(KEEPALIVE_RETRY_MAX);
+            if now.duration_since(pending.last_sent_at) >= retry {
                 pending.last_sent_at = now;
                 return PeerTick::Keepalive(pending.token);
             }
@@ -270,7 +313,7 @@ impl PeerState {
             return PeerTick::Drop(DropReason::Expired);
         }
 
-        if now.duration_since(self.last_seen) >= timings.keepalive_interval {
+        if now.duration_since(self.last_ack) >= timings.keepalive_interval {
             self.keepalive = Some(KeepalivePending {
                 token,
                 first_sent_at: now,
@@ -314,6 +357,14 @@ impl PeerState {
             None => PathProbe::Lookup,
         }
     }
+}
+
+/// What a received keepalive ack answered.
+#[derive(Debug, PartialEq, Eq)]
+pub enum KeepaliveAck {
+    Keepalive,
+    Probe,
+    Unknown,
 }
 
 /// How to try to get a relayed session onto a direct path.
@@ -671,6 +722,7 @@ mod tests {
             tx_seq: 0,
             rx_replay: ReplayWindow::new(),
             last_seen: now,
+            last_ack: now,
             routes: Vec::new(),
             handshake_initiator_id: 1,
             keepalive: None,
@@ -693,8 +745,9 @@ mod tests {
         assert_eq!(peer.tick(idle, &timings, 7), PeerTick::Keepalive(7));
         // Still waiting for the ack: repeat the same token instead of a new probe.
         assert_eq!(peer.tick(idle, &timings, 8), PeerTick::Idle);
+        // Unanswered keepalives are repeated quickly, well inside the timeout.
         assert_eq!(
-            peer.tick(idle + timings.keepalive_interval, &timings, 8),
+            peer.tick(idle + KEEPALIVE_RETRY_MAX, &timings, 8),
             PeerTick::Keepalive(7)
         );
 
@@ -706,23 +759,26 @@ mod tests {
     }
 
     #[test]
-    fn a_peer_that_still_sends_traffic_survives_lost_acks() {
+    fn inbound_traffic_does_not_hide_a_dead_sending_direction() {
         let timings = timings();
         let start = Instant::now();
         let mut peer = test_peer(start, None, false);
 
+        // The peer keeps sending to us all the time, yet our keepalive still goes
+        // out: what arrives proves nothing about what we send.
         let mut now = start + timings.keepalive_interval;
+        peer.mark_seen(peer.addr, now, false, false);
         assert_eq!(peer.tick(now, &timings, 7), PeerTick::Keepalive(7));
 
-        // Acks never arrive, but the peer keeps sending: the session stays up.
-        for _ in 0..6 {
-            now += timings.keepalive_interval;
-            peer.mark_seen(peer.addr, now);
-            assert!(!matches!(peer.tick(now, &timings, 8), PeerTick::Drop(_)));
+        // Acks never arrive while inbound traffic continues: the session is dead.
+        let first_sent = now;
+        while now < first_sent + timings.keepalive_timeout {
+            now += Duration::from_secs(1);
+            peer.mark_seen(peer.addr, now, false, false);
+            if now < first_sent + timings.keepalive_timeout {
+                assert!(!matches!(peer.tick(now, &timings, 8), PeerTick::Drop(_)));
+            }
         }
-
-        // Now it goes quiet in both directions.
-        now += timings.keepalive_timeout;
         assert_eq!(
             peer.tick(now, &timings, 9),
             PeerTick::Drop(DropReason::KeepaliveTimeout)
@@ -737,10 +793,14 @@ mod tests {
         let idle = start + timings.keepalive_interval;
 
         assert_eq!(peer.tick(idle, &timings, 7), PeerTick::Keepalive(7));
-        assert!(!peer.ack_keepalive(6));
-        assert!(peer.ack_keepalive(7));
-        peer.mark_seen(peer.addr, idle);
+        assert_eq!(peer.ack_keepalive(6, idle), KeepaliveAck::Unknown);
+        assert_eq!(peer.ack_keepalive(7, idle), KeepaliveAck::Keepalive);
         assert_eq!(peer.tick(idle, &timings, 9), PeerTick::Idle);
+        // The next keepalive is due one interval after the ack.
+        assert_eq!(
+            peer.tick(idle + timings.keepalive_interval, &timings, 10),
+            PeerTick::Keepalive(10)
+        );
     }
 
     #[test]
@@ -787,10 +847,53 @@ mod tests {
             peer.take_path_probe(start, &timings, 1),
             PathProbe::Punch(_, _)
         ));
-        assert_eq!(peer.mark_seen(direct, start), Some(test_addr(1000)));
+        assert_eq!(peer.ack_keepalive(1, start), KeepaliveAck::Probe);
+        assert_eq!(
+            peer.mark_seen(direct, start, false, false),
+            Some(test_addr(1000))
+        );
         assert!(!peer.relayed);
         assert_eq!(peer.addr, direct);
         assert_eq!(peer.take_path_probe(start, &timings, 2), PathProbe::None);
+    }
+
+    #[test]
+    fn a_punch_from_the_peer_does_not_move_a_relayed_session() {
+        let timings = timings();
+        let start = Instant::now();
+        let relay = test_addr(1000);
+        let punched_from = test_addr(2500);
+        let mut peer = test_peer(start, Some(test_addr(2000)), true);
+        peer.next_probe = Some(start + Duration::from_secs(60));
+
+        // Only the peer's direction is proven: stay on the relay, but punch back
+        // towards where the probe came from right away.
+        assert_eq!(peer.mark_seen(punched_from, start, false, true), None);
+        assert!(peer.relayed);
+        assert_eq!(peer.addr, relay);
+        assert_eq!(peer.direct_addr, Some(punched_from));
+        assert_eq!(
+            peer.take_path_probe(start, &timings, 4),
+            PathProbe::Punch(punched_from, 4)
+        );
+    }
+
+    #[test]
+    fn late_relayed_packets_do_not_pull_a_direct_session_back() {
+        let start = Instant::now();
+        let relay = test_addr(1000);
+        let direct = test_addr(2000);
+        let mut peer = test_peer(start, Some(direct), true);
+
+        assert!(peer.mark_seen(direct, start, false, false).is_some());
+        assert_eq!(peer.mark_seen(relay, start, true, false), None);
+        assert_eq!(peer.addr, direct);
+        assert!(!peer.relayed);
+
+        // A NAT rebind on the direct path is still followed.
+        let rebound = test_addr(2001);
+        assert_eq!(peer.mark_seen(rebound, start, false, false), Some(direct));
+        assert_eq!(peer.direct_addr, Some(rebound));
     }
 
     #[test]
