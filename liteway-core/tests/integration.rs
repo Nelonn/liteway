@@ -516,6 +516,111 @@ fn keepalive_ack_packet_roundtrip() {
 }
 
 #[test]
+fn policy_announce_packet_roundtrip() {
+    let session_key = make_session_key();
+    let network_key = make_network_key();
+    let pkt = packet::encrypt_policy_announce_packet(
+        16,
+        0x01020304,
+        0x05060708,
+        42,
+        &network_key,
+        &session_key,
+    );
+    let serialized = packet::serialize_packet(&pkt);
+
+    assert_eq!(
+        decrypt_test_packet(&serialized, &network_key, &session_key).unwrap(),
+        packet::PacketBody::PolicyAnnounce {
+            seq: 16,
+            version: 42,
+        }
+    );
+}
+
+#[test]
+fn policy_bundle_packet_roundtrip_keeps_the_signature_valid() {
+    use liteway_core::policy::{AclRule, PolicyBody, SignedPolicy};
+
+    let ca = cert::generate_ca("ca", 1, &[]);
+    let signed = SignedPolicy::sign(
+        PolicyBody {
+            version: 3,
+            issued_at: chrono::Utc::now(),
+            revoked: Vec::new(),
+            acl: Some(vec![AclRule {
+                from: vec!["laptops".into()],
+                to: vec!["servers".into()],
+            }]),
+        },
+        &ca.signing_key,
+    );
+    let session_key = make_session_key();
+    let network_key = make_network_key();
+    let pkt = packet::encrypt_policy_bundle_packet(
+        17,
+        0x01020304,
+        0x05060708,
+        &signed,
+        &network_key,
+        &session_key,
+    );
+    let serialized = packet::serialize_packet(&pkt);
+
+    match decrypt_test_packet(&serialized, &network_key, &session_key).unwrap() {
+        packet::PacketBody::PolicyBundle { seq, policy } => {
+            assert_eq!(seq, 17);
+            assert_eq!(*policy, signed);
+            assert!(policy.verify(&ca.cert.verify_key));
+        }
+        other => panic!("unexpected packet {other:?}"),
+    }
+}
+
+#[test]
+fn lighthouse_list_packets_roundtrip() {
+    let session_key = make_session_key();
+    let network_key = make_network_key();
+
+    let query = packet::encrypt_lighthouse_list_query_packet(
+        18,
+        0x01020304,
+        0x05060708,
+        &network_key,
+        &session_key,
+    );
+    assert_eq!(
+        decrypt_test_packet(
+            &packet::serialize_packet(&query),
+            &network_key,
+            &session_key
+        )
+        .unwrap(),
+        packet::PacketBody::LighthouseListQuery { seq: 18 }
+    );
+
+    let peers = vec![packet::PeerListEntry {
+        peer_id: 7,
+        name: "server".into(),
+        ip: "10.0.0.3".parse().unwrap(),
+        routes: vec!["10.0.0.3/32".into(), "192.168.10.0/24".into()],
+        is_relay: false,
+    }];
+    let list = packet::encrypt_lighthouse_list_packet(
+        19,
+        0x01020304,
+        0x05060708,
+        &peers,
+        &network_key,
+        &session_key,
+    );
+    assert_eq!(
+        decrypt_test_packet(&packet::serialize_packet(&list), &network_key, &session_key).unwrap(),
+        packet::PacketBody::LighthouseList { seq: 19, peers }
+    );
+}
+
+#[test]
 fn relay_forward_outer_and_inner_keys_are_separate() {
     let direct_key = make_session_key();
     let relay_key = make_session_key();
@@ -577,6 +682,7 @@ fn app_config_with_secret(network_secret: &str) -> AppConfig {
         node_cert_path: "node-cert.toml".to_string(),
         node_key_path: "node-key.toml".to_string(),
         network_secret: network_secret.to_string(),
+        policy_path: None,
         lighthouses: vec![],
         interface: Some(InterfaceConfig::default()),
         am_lighthouse: false,

@@ -6,7 +6,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket}
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Context;
 use clap::Parser;
@@ -17,7 +17,8 @@ use liteway_core::crypto::kdf;
 use liteway_core::crypto::{K_HEADER_LEN, SESSION_KEY_LEN};
 use liteway_core::frag::{self, FeedResult, FragmentAssembler};
 use liteway_core::handshake;
-use liteway_core::packet::{self, PacketBody};
+use liteway_core::packet::{self, PacketBody, PeerListEntry};
+use liteway_core::policy::{Policy, SignedPolicy};
 use liteway_core::tunnel::{TunDevice, TunWriter};
 use rand::Rng;
 use zeroize::{Zeroize, Zeroizing};
@@ -35,6 +36,13 @@ const MAINTENANCE_TICK: Duration = Duration::from_millis(250);
 const LIGHTHOUSE_RERESOLVE: Duration = Duration::from_secs(60);
 /// Bounds how long the receive thread takes to notice shutdown.
 const SOCKET_READ_TIMEOUT: Duration = Duration::from_millis(250);
+/// Peers re-announce their policy version this often, so a bundle push lost on
+/// the wire is retried instead of leaving a node on a stale revocation list.
+const POLICY_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(60);
+const POLICY_PUSH_MIN_INTERVAL: Duration = Duration::from_secs(10);
+const LIGHTHOUSE_LIST_INTERVAL: Duration = Duration::from_secs(60);
+/// Keeps the list inside the fragment limit (255 fragments of ~1.1 KiB).
+const MAX_PEER_LIST_ENTRIES: usize = 1024;
 const ROUTE_ALL_GRANT: &str = "route:*";
 const ROUTE_GRANT_PREFIX: &str = "route:";
 
@@ -71,6 +79,14 @@ struct Node {
     lighthouses: Mutex<Vec<LighthouseSlot>>,
     handshake_cache: Mutex<HandshakeCache>,
     discovery_pending: Mutex<HashMap<IpAddr, Instant>>,
+    /// Swapped whole on update; handlers take a snapshot, so one decision never
+    /// mixes an old bundle with a new one.
+    policy: Mutex<Arc<Policy>>,
+    policy_path: Option<String>,
+    policy_file_mtime: Mutex<Option<SystemTime>>,
+    last_policy_announce: Mutex<Instant>,
+    /// Peer lists received from each lighthouse, keyed by lighthouse name.
+    peer_directory: Mutex<HashMap<String, Vec<PeerListEntry>>>,
     running: AtomicBool,
     shutdown: (Mutex<bool>, Condvar),
 }
@@ -81,6 +97,7 @@ struct PeerTx {
     seq: u64,
     session_id: u32,
     key: [u8; SESSION_KEY_LEN],
+    data_allowed: bool,
 }
 
 impl Drop for PeerTx {
@@ -142,6 +159,15 @@ fn main() -> anyhow::Result<()> {
             "node key '{}' does not belong to certificate '{}'",
             config.node_key_path,
             config.node_cert_path
+        );
+    }
+
+    let (policy, policy_mtime) = load_startup_policy(config.policy_path.as_deref(), &ca_vk)?;
+    if policy.is_revoked(&node_cert) {
+        anyhow::bail!(
+            "node certificate '{}' is revoked by policy version {}",
+            config.node_cert_path,
+            policy.version()
         );
     }
 
@@ -279,6 +305,11 @@ fn main() -> anyhow::Result<()> {
         lighthouses: Mutex::new(resolve_lighthouses(&config.lighthouses)?),
         handshake_cache: Mutex::new(HandshakeCache::new()),
         discovery_pending: Mutex::new(HashMap::new()),
+        policy: Mutex::new(Arc::new(policy)),
+        policy_path: config.policy_path.clone(),
+        policy_file_mtime: Mutex::new(policy_mtime),
+        last_policy_announce: Mutex::new(Instant::now()),
+        peer_directory: Mutex::new(HashMap::new()),
         running: AtomicBool::new(true),
         shutdown: (Mutex::new(false), Condvar::new()),
     });
@@ -291,7 +322,9 @@ fn main() -> anyhow::Result<()> {
         .name("liteway-punch".into())
         .spawn(move || {
             while punch_node.running.load(Ordering::SeqCst) {
+                punch_node.reload_policy_file();
                 punch_node.connect_lighthouses();
+                punch_node.announce_policy_periodically();
                 punch_node.wait_for_shutdown_or_timeout(punch_interval);
             }
         })
@@ -430,6 +463,7 @@ impl Node {
             seq: peer.next_seq(),
             session_id: peer.tx_session_id,
             key: peer.tx_key,
+            data_allowed: peer.data_allowed,
         })
     }
 
@@ -508,6 +542,8 @@ impl Node {
         session_key.zeroize();
         let routes = authorized_peer_routes(cert);
         let now = Instant::now();
+        let policy = self.current_policy();
+        let data_allowed = policy.allows_either(&self.cert, cert);
 
         let old_rx_session_id;
         {
@@ -566,6 +602,8 @@ impl Node {
                     next_probe: None,
                     probe_interval: self.timings.direct_probe_interval,
                     probe_token: None,
+                    data_allowed,
+                    policy_pushed_at: None,
                 },
             );
             old_rx_session_id = old_peer.map(|old| old.rx_session_id);
@@ -602,6 +640,21 @@ impl Node {
         }
 
         self.bind_lighthouse(addr, &cert.body.meta.name, id);
+        // A bundle adopted while this session was being installed was enforced
+        // on the peers that existed then, which did not include this one yet.
+        let latest = self.current_policy();
+        if latest.version() != policy.version() {
+            self.enforce_policy(&latest);
+        }
+        if !data_allowed {
+            log::info!(
+                "session with {} ({}) carries control traffic only: the ACL allows no data between us",
+                cert.body.meta.name,
+                id
+            );
+        }
+        // Whichever side holds the newer bundle hands it over in reply.
+        self.send_policy_announce(id);
         AddPeerOutcome::Added
     }
 
@@ -658,6 +711,8 @@ impl Node {
             for lighthouse in lighthouses.iter_mut() {
                 if lighthouse.address == addr || lighthouse.name == name {
                     lighthouse.peer_id = Some(peer_id);
+                    // A new session may come with a new view: ask again right away.
+                    lighthouse.list_requested_at = None;
                 }
             }
         }
@@ -691,8 +746,9 @@ impl Node {
             if !self.running.load(Ordering::SeqCst) {
                 return;
             }
-            if connected.is_some() {
+            if let Some(peer_id) = connected {
                 log::debug!("lighthouse {} is connected", lighthouse.name);
+                self.request_peer_list(lighthouse, peer_id);
                 continue;
             }
 
@@ -800,6 +856,307 @@ impl Node {
                 log::info!("lighthouse lookup {} via {} ({})", dst_ip, name, tx.addr);
             }
         }
+    }
+
+    // ---------------------------------------------------------------- policy
+
+    /// A poisoned lock still holds the last bundle that was fully installed;
+    /// falling back to an open policy instead would un-revoke everything.
+    fn current_policy(&self) -> Arc<Policy> {
+        match self.policy.lock() {
+            Ok(policy) => policy.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    /// Whether a peer that completed a handshake with us may have a session.
+    ///
+    /// `we_dialed` means our own handshake to this peer is in flight. We only
+    /// start those towards configured lighthouses and peers the policy lets us
+    /// talk to, so revocation is all that is left to check for them.
+    fn admit_peer(&self, cert: &Cert, we_dialed: bool) -> Result<(), String> {
+        let policy = self.current_policy();
+        if policy.is_revoked(cert) {
+            return Err(format!(
+                "certificate revoked by policy version {}",
+                policy.version()
+            ));
+        }
+        // Lighthouses and relays have to serve every member. Whether data may
+        // reach their own address is still decided per session (`data_allowed`).
+        if we_dialed || self.am_lighthouse || self.am_relay || policy.allows(cert, &self.cert) {
+            return Ok(());
+        }
+        Err(format!(
+            "denied by ACL in policy version {}",
+            policy.version()
+        ))
+    }
+
+    /// Install a bundle if it is newer than ours and genuinely from the CA, then
+    /// apply it to the sessions that already exist and pass it on.
+    fn adopt_policy(&self, signed: SignedPolicy, source: &str, persist: bool) -> bool {
+        let version = signed.body.version;
+        if version <= self.current_policy().version() {
+            log::debug!(
+                "ignoring policy version {} from {}: not newer than ours",
+                version,
+                source
+            );
+            return false;
+        }
+        let to_persist = persist.then(|| signed.clone());
+        let policy = match Policy::from_signed(signed, &self.ca_vk) {
+            Ok(policy) => Arc::new(policy),
+            Err(e) => {
+                log::warn!(
+                    "rejecting policy version {} from {}: {:#}",
+                    version,
+                    source,
+                    e
+                );
+                return false;
+            }
+        };
+        {
+            let mut slot = match self.policy.lock() {
+                Ok(slot) => slot,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            // Re-checked under the lock: two sources delivering at once must not
+            // let the older bundle land last.
+            if version <= slot.version() {
+                return false;
+            }
+            *slot = policy.clone();
+        }
+        log::info!(
+            "adopted policy version {} from {}: {}",
+            version,
+            source,
+            policy.summary()
+        );
+        if policy.is_revoked(&self.cert) {
+            log::error!(
+                "this node's certificate is revoked by policy version {}; peers will refuse it",
+                version
+            );
+        }
+
+        if let (Some(signed), Some(path)) = (to_persist, self.policy_path.as_deref()) {
+            match signed.save(path) {
+                Ok(()) => {
+                    // Our own write must not be picked up as an operator edit.
+                    if let Ok(mut mtime) = self.policy_file_mtime.lock() {
+                        *mtime = file_mtime(path);
+                    }
+                }
+                Err(e) => log::warn!(
+                    "could not save policy version {} to '{}': {}; it will be lost on restart",
+                    version,
+                    path,
+                    e
+                ),
+            }
+        }
+
+        if let Ok(mut cache) = self.handshake_cache.lock() {
+            cache.clear();
+        }
+        self.enforce_policy(&policy);
+        self.announce_policy_to_all();
+        true
+    }
+
+    /// Bring existing sessions in line with a new bundle: revoked peers and peers
+    /// the ACL no longer lets us talk to are disconnected.
+    fn enforce_policy(&self, policy: &Policy) {
+        let lighthouse_ids: Vec<u32> = match self.lighthouses.lock() {
+            Ok(lighthouses) => lighthouses.iter().filter_map(|l| l.peer_id).collect(),
+            Err(_) => Vec::new(),
+        };
+
+        let mut drops = Vec::new();
+        {
+            let Ok(mut peers) = self.peers.lock() else {
+                return;
+            };
+            for (peer_id, peer) in peers.iter_mut() {
+                if policy.is_revoked(&peer.cert) {
+                    drops.push((*peer_id, "certificate revoked"));
+                    continue;
+                }
+                peer.data_allowed = policy.allows_either(&self.cert, &peer.cert);
+                // The same sessions admit_peer lets in without an ACL rule.
+                let infrastructure =
+                    self.am_lighthouse || self.am_relay || lighthouse_ids.contains(peer_id);
+                if !peer.data_allowed && !infrastructure {
+                    drops.push((*peer_id, "denied by ACL"));
+                }
+            }
+        }
+
+        for (peer_id, reason) in drops {
+            self.disconnect_peer(peer_id, reason);
+        }
+    }
+
+    /// Tell the peer before forgetting it, so it stops sending into a session we
+    /// no longer have instead of waiting out its keepalive timeout.
+    fn disconnect_peer(&self, peer_id: u32, reason: &str) {
+        if let Some(tx) = self.peer_tx(peer_id) {
+            let pkt = packet::encrypt_disconnect_packet(
+                tx.seq,
+                peer_id,
+                tx.session_id,
+                &self.network_key,
+                &tx.key,
+            );
+            self.send_wire(&packet::serialize_packet(&pkt), tx.addr, "disconnect");
+        }
+        self.remove_peer(peer_id, reason);
+    }
+
+    /// Pick up a bundle the operator dropped into `policy_path`.
+    fn reload_policy_file(&self) {
+        let Some(path) = self.policy_path.as_deref() else {
+            return;
+        };
+        let Some(mtime) = file_mtime(path) else {
+            return;
+        };
+        {
+            let Ok(mut last) = self.policy_file_mtime.lock() else {
+                return;
+            };
+            if *last == Some(mtime) {
+                return;
+            }
+            *last = Some(mtime);
+        }
+        match SignedPolicy::from_file(path) {
+            Ok(signed) => {
+                self.adopt_policy(signed, &format!("file '{path}'"), false);
+            }
+            Err(e) => log::warn!("reloading policy failed: {:#}", e),
+        }
+    }
+
+    fn send_policy_announce(&self, peer_id: u32) {
+        let version = self.current_policy().version();
+        let Some(tx) = self.peer_tx(peer_id) else {
+            return;
+        };
+        let pkt = packet::encrypt_policy_announce_packet(
+            tx.seq,
+            peer_id,
+            tx.session_id,
+            version,
+            &self.network_key,
+            &tx.key,
+        );
+        self.send_wire(&packet::serialize_packet(&pkt), tx.addr, "policy announce");
+    }
+
+    fn announce_policy_to_all(&self) {
+        let peer_ids: Vec<u32> = match self.peers.lock() {
+            Ok(peers) => peers.keys().copied().collect(),
+            Err(_) => return,
+        };
+        for peer_id in peer_ids {
+            self.send_policy_announce(peer_id);
+        }
+    }
+
+    fn announce_policy_periodically(&self) {
+        let now = Instant::now();
+        {
+            let Ok(mut last) = self.last_policy_announce.lock() else {
+                return;
+            };
+            if now.duration_since(*last) < POLICY_ANNOUNCE_INTERVAL {
+                return;
+            }
+            *last = now;
+        }
+        self.announce_policy_to_all();
+    }
+
+    /// Versions only travel one way per exchange: the side that is ahead pushes
+    /// the bundle, the side that is behind says so by announcing its own version.
+    fn handle_policy_announce(&self, peer_id: u32, version: u64) {
+        let policy = self.current_policy();
+        let ours = policy.version();
+        if version > ours {
+            log::debug!(
+                "peer {} holds policy version {} (ours is {}); asking for it",
+                peer_id,
+                version,
+                ours
+            );
+            self.send_policy_announce(peer_id);
+        } else if version < ours {
+            self.push_policy(peer_id, &policy);
+        }
+    }
+
+    fn push_policy(&self, peer_id: u32, policy: &Policy) {
+        let Some(signed) = policy.signed.as_ref() else {
+            return;
+        };
+        let now = Instant::now();
+        let tx = {
+            let Ok(mut peers) = self.peers.lock() else {
+                return;
+            };
+            let Some(peer) = peers.get_mut(&peer_id) else {
+                return;
+            };
+            if peer
+                .policy_pushed_at
+                .is_some_and(|at| now.duration_since(at) < POLICY_PUSH_MIN_INTERVAL)
+            {
+                return;
+            }
+            peer.policy_pushed_at = Some(now);
+            PeerTx {
+                addr: peer.addr,
+                seq: peer.next_seq(),
+                session_id: peer.tx_session_id,
+                key: peer.tx_key,
+                data_allowed: peer.data_allowed,
+            }
+        };
+        let pkt = packet::encrypt_policy_bundle_packet(
+            tx.seq,
+            peer_id,
+            tx.session_id,
+            signed,
+            &self.network_key,
+            &tx.key,
+        );
+        if self.send_message(
+            &packet::serialize_packet(&pkt),
+            tx.addr,
+            peer_id,
+            "policy bundle",
+        ) {
+            log::debug!(
+                "sent policy version {} to peer {}",
+                signed.body.version,
+                peer_id
+            );
+        }
+    }
+
+    fn handle_policy_bundle(&self, peer_id: u32, signed: SignedPolicy) {
+        let name = self
+            .peers
+            .lock()
+            .ok()
+            .and_then(|peers| peers.get(&peer_id).map(|peer| peer.name.clone()))
+            .unwrap_or_else(|| "?".to_string());
+        self.adopt_policy(signed, &format!("peer {name} ({peer_id})"), true);
     }
 
     // ---------------------------------------------------------------- maintenance
@@ -1121,6 +1478,14 @@ impl Node {
                 .map(|entry| (entry.response.clone(), entry.peer_id))
         });
         if let Some((response, peer_id)) = cached {
+            let Some(response) = response else {
+                log::debug!(
+                    "dropping repeated handshake_1 from refused peer {} at {}",
+                    peer_id,
+                    src
+                );
+                return;
+            };
             log::debug!(
                 "answering repeated handshake_1 from {} ({}) from cache",
                 src,
@@ -1160,10 +1525,6 @@ impl Node {
             return;
         }
 
-        if let Ok(mut cache) = self.handshake_cache.lock() {
-            cache.insert(digest, response.msg.clone(), peer_id, now);
-        }
-
         // Anything arriving from a relay's address took the relayed path, so the
         // session starts out relayed and gets probed towards its direct endpoint.
         let relayed = self.addr_is_relay(src);
@@ -1176,6 +1537,29 @@ impl Node {
                 Err(_) => (false, None),
             }
         };
+
+        // Checked before the answer is cached, so a refused peer is never served
+        // the session from the cache; its retransmissions hit the cached refusal.
+        // Our own handshake to the same peer being in flight means this one is the
+        // other half of a punch we asked for.
+        if let Err(reason) = self.admit_peer(&response.peer_cert, simultaneous) {
+            log::warn!(
+                "refusing handshake from {} ({}) at {}: {}",
+                response.peer_cert.body.meta.name,
+                peer_id,
+                src,
+                reason
+            );
+            if let Ok(mut cache) = self.handshake_cache.lock() {
+                cache.insert(digest, None, peer_id, now);
+            }
+            return;
+        }
+
+        if let Ok(mut cache) = self.handshake_cache.lock() {
+            cache.insert(digest, Some(response.msg.clone()), peer_id, now);
+        }
+
         let direct_addr = direct_addr.or(if relayed { None } else { Some(src) });
 
         let outcome = self.add_peer(
@@ -1263,6 +1647,17 @@ impl Node {
         let Some((result, peer_id, direct_addr)) = completed else {
             return;
         };
+
+        if let Err(reason) = self.admit_peer(&result.peer_cert, true) {
+            log::warn!(
+                "dropping session with {} ({}) at {}: {}",
+                result.peer_cert.body.meta.name,
+                peer_id,
+                src,
+                reason
+            );
+            return;
+        }
 
         let relayed = src != direct_addr || self.addr_is_relay(src);
         let simultaneous = self.peers.lock().ok().is_some_and(|peers| {
@@ -1454,16 +1849,34 @@ impl Node {
                 }
             }
             PacketBody::Disconnect { .. } => self.remove_peer(peer_id, "peer disconnected"),
+            PacketBody::PolicyAnnounce { version, .. } => {
+                self.handle_policy_announce(peer_id, version)
+            }
+            PacketBody::PolicyBundle { policy, .. } => self.handle_policy_bundle(peer_id, *policy),
+            PacketBody::LighthouseListQuery { .. } => self.handle_lighthouse_list_query(peer_id),
+            PacketBody::LighthouseList { peers, .. } => self.handle_lighthouse_list(peer_id, peers),
         }
     }
 
     fn handle_data(&self, peer_id: u32, ip_packet: &[u8], tun_writer: &mut Option<TunWriter>) {
-        let allowed = self.peers.lock().is_ok_and(|peers| {
-            peers
-                .get(&peer_id)
-                .is_some_and(|peer| peer_allows_ip_packet_source(peer, ip_packet))
-        });
-        if !allowed {
+        let (acl_allowed, source_allowed) = self
+            .peers
+            .lock()
+            .ok()
+            .and_then(|peers| {
+                peers.get(&peer_id).map(|peer| {
+                    (
+                        peer.data_allowed,
+                        peer_allows_ip_packet_source(peer, ip_packet),
+                    )
+                })
+            })
+            .unwrap_or((false, false));
+        if !acl_allowed {
+            log::debug!("dropping data packet from {}: denied by ACL", peer_id);
+            return;
+        }
+        if !source_allowed {
             log::warn!(
                 "dropping data packet from {} with unauthorized source address",
                 peer_id
@@ -1516,6 +1929,7 @@ impl Node {
             .ok()
             .and_then(|routes| routes.lookup(target_ip));
 
+        let policy = self.current_policy();
         let mut responses: Vec<(SocketAddr, u32, Vec<u8>)> = Vec::new();
         {
             let Ok(mut peers) = self.peers.lock() else {
@@ -1539,16 +1953,27 @@ impl Node {
                 return;
             };
 
+            // A target the requester may not reach is answered as unknown: telling
+            // it apart from "denied" would still reveal who is on the network.
+            let mut denied = false;
             let target = target_peer_id.and_then(|id| {
-                peers.get(&id).map(|peer| {
-                    (
-                        id,
-                        peer.addr,
-                        peer.cert.clone(),
-                        peer.is_relay,
-                        peer.name.clone(),
-                    )
-                })
+                peers
+                    .get(&id)
+                    .filter(|peer| {
+                        let allowed = !policy.is_revoked(&peer.cert)
+                            && policy.allows(&requester_cert, &peer.cert);
+                        denied = !allowed;
+                        allowed
+                    })
+                    .map(|peer| {
+                        (
+                            id,
+                            peer.addr,
+                            peer.cert.clone(),
+                            peer.is_relay,
+                            peer.name.clone(),
+                        )
+                    })
             });
 
             log::info!(
@@ -1630,7 +2055,12 @@ impl Node {
                 }
                 None => {
                     log::info!(
-                        "lighthouse has no route for {} requested by {} ({})",
+                        "lighthouse {} {} requested by {} ({})",
+                        if denied {
+                            "withholds (denied by ACL)"
+                        } else {
+                            "has no route for"
+                        },
                         target_ip,
                         requester_name,
                         requester_id
@@ -1697,6 +2127,19 @@ impl Node {
             );
             return;
         }
+        // Either direction counts: an introduction asks us to punch back towards
+        // a peer that may reach us even if we may not open sessions to it, and that
+        // peer only accepts our handshake because its own is in flight.
+        let policy = self.current_policy();
+        if policy.is_revoked(&peer_cert) || !policy.allows_either(&self.cert, &peer_cert) {
+            log::info!(
+                "not connecting to {} for {}: denied by policy version {}",
+                peer_cert.body.meta.name,
+                target_ip,
+                policy.version()
+            );
+            return;
+        }
 
         // An established session only needs the endpoint: the probe loop upgrades
         // a relayed path for the price of one datagram, instead of a full handshake.
@@ -1734,6 +2177,163 @@ impl Node {
             &peer_cert.body.meta.name,
             "lighthouse discovery",
         );
+    }
+
+    /// Answer with every peer the requester may open a session to, and nobody
+    /// else: a node learns nothing about the parts of the network it is fenced
+    /// off from.
+    fn handle_lighthouse_list_query(&self, requester_id: u32) {
+        if !self.am_lighthouse {
+            log::debug!("peer list query ignored: lighthouse mode disabled");
+            return;
+        }
+
+        let policy = self.current_policy();
+        let mut entries = Vec::new();
+        let tx = {
+            let Ok(mut peers) = self.peers.lock() else {
+                return;
+            };
+            let Some(requester_cert) = peers.get(&requester_id).map(|peer| peer.cert.clone())
+            else {
+                return;
+            };
+            for (peer_id, peer) in peers.iter() {
+                if *peer_id == requester_id
+                    || policy.is_revoked(&peer.cert)
+                    || !policy.allows(&requester_cert, &peer.cert)
+                {
+                    continue;
+                }
+                let Some(ip) = primary_cert_ip(&peer.cert) else {
+                    continue;
+                };
+                entries.push(PeerListEntry {
+                    peer_id: *peer_id,
+                    name: peer.name.clone(),
+                    ip,
+                    routes: peer.routes.iter().map(|route| route.to_string()).collect(),
+                    is_relay: peer.is_relay,
+                });
+            }
+            let Some(requester) = peers.get_mut(&requester_id) else {
+                return;
+            };
+            PeerTx {
+                addr: requester.addr,
+                seq: requester.next_seq(),
+                session_id: requester.tx_session_id,
+                key: requester.tx_key,
+                data_allowed: requester.data_allowed,
+            }
+        };
+
+        entries.sort_by_key(|entry| entry.ip);
+        if entries.len() > MAX_PEER_LIST_ENTRIES {
+            log::warn!(
+                "peer list for {} truncated from {} to {} entries",
+                requester_id,
+                entries.len(),
+                MAX_PEER_LIST_ENTRIES
+            );
+            entries.truncate(MAX_PEER_LIST_ENTRIES);
+        }
+        log::debug!(
+            "sending peer list ({} entries) to {}",
+            entries.len(),
+            requester_id
+        );
+
+        let pkt = packet::encrypt_lighthouse_list_packet(
+            tx.seq,
+            requester_id,
+            tx.session_id,
+            &entries,
+            &self.network_key,
+            &tx.key,
+        );
+        self.send_message(
+            &packet::serialize_packet(&pkt),
+            tx.addr,
+            requester_id,
+            "peer list",
+        );
+    }
+
+    fn handle_lighthouse_list(&self, sender_id: u32, mut entries: Vec<PeerListEntry>) {
+        let lighthouse = self.lighthouses.lock().ok().and_then(|lighthouses| {
+            lighthouses
+                .iter()
+                .find(|lighthouse| lighthouse.peer_id == Some(sender_id))
+                .map(|lighthouse| lighthouse.name.clone())
+        });
+        let Some(lighthouse) = lighthouse else {
+            log::debug!(
+                "ignoring peer list from {}: not a configured lighthouse",
+                sender_id
+            );
+            return;
+        };
+
+        entries.sort_by_key(|entry| entry.ip);
+        let changed = match self.peer_directory.lock() {
+            Ok(mut directory) => {
+                if directory.get(&lighthouse) == Some(&entries) {
+                    false
+                } else {
+                    directory.insert(lighthouse.clone(), entries.clone());
+                    true
+                }
+            }
+            Err(_) => return,
+        };
+        if changed {
+            let names: Vec<String> = entries
+                .iter()
+                .map(|entry| format!("{} [{}]", entry.name, entry.ip))
+                .collect();
+            if names.is_empty() {
+                log::info!("lighthouse {} lists no reachable peers", lighthouse);
+            } else {
+                log::info!(
+                    "lighthouse {} lists {} reachable peer(s): {}",
+                    lighthouse,
+                    entries.len(),
+                    names.join(", ")
+                );
+            }
+        }
+    }
+
+    /// Ask a connected lighthouse which peers we may reach, once per
+    /// [`LIGHTHOUSE_LIST_INTERVAL`].
+    fn request_peer_list(&self, lighthouse: &LighthouseSlot, peer_id: u32) {
+        let now = Instant::now();
+        if lighthouse
+            .list_requested_at
+            .is_some_and(|at| now.duration_since(at) < LIGHTHOUSE_LIST_INTERVAL)
+        {
+            return;
+        }
+        if let Ok(mut lighthouses) = self.lighthouses.lock() {
+            for slot in lighthouses.iter_mut() {
+                if slot.name == lighthouse.name && slot.configured == lighthouse.configured {
+                    slot.list_requested_at = Some(now);
+                }
+            }
+        }
+
+        let Some(tx) = self.peer_tx(peer_id) else {
+            return;
+        };
+        let pkt = packet::encrypt_lighthouse_list_query_packet(
+            tx.seq,
+            peer_id,
+            tx.session_id,
+            &self.network_key,
+            &tx.key,
+        );
+        self.send_wire(&packet::serialize_packet(&pkt), tx.addr, "peer list query");
     }
 
     /// Acks go back to where the keepalive came from, not to the session's
@@ -1808,6 +2408,12 @@ impl Node {
             log::debug!("no peer {} in peers map", peer_id);
             return;
         };
+        // The receiver would drop it anyway; not sending keeps a denied
+        // destination from costing bandwidth on both ends.
+        if !tx.data_allowed {
+            log::debug!("not sending to {} ({}): denied by ACL", dst_ip, peer_id);
+            return;
+        }
         let pkt = packet::encrypt_data_packet(
             tx.seq,
             peer_id,
@@ -1836,6 +2442,7 @@ impl Node {
                             seq: peer.next_seq(),
                             session_id: peer.tx_session_id,
                             key: peer.tx_key,
+                            data_allowed: peer.data_allowed,
                         },
                     )
                 })
@@ -1917,6 +2524,40 @@ fn warn_on_oversized_mtu(config: &AppConfig, listen: SocketAddr) {
     }
 }
 
+fn file_mtime(path: &str) -> Option<SystemTime> {
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+}
+
+/// A configured but missing policy file is not an error: the first bundle that
+/// arrives from a peer is written there.
+fn load_startup_policy(
+    path: Option<&str>,
+    ca_vk: &CaVerifyKey,
+) -> anyhow::Result<(Policy, Option<SystemTime>)> {
+    let Some(path) = path else {
+        return Ok((Policy::open(), None));
+    };
+    if !std::path::Path::new(path).exists() {
+        log::info!(
+            "policy file '{}' does not exist yet; running without revocations or ACL until a peer provides a bundle",
+            path
+        );
+        return Ok((Policy::open(), None));
+    }
+    let signed = SignedPolicy::from_file(path)?;
+    let policy = Policy::from_signed(signed, ca_vk)
+        .with_context(|| format!("verify policy file '{path}'"))?;
+    log::info!(
+        "policy version {} loaded from '{}': {}",
+        policy.version(),
+        path,
+        policy.summary()
+    );
+    Ok((policy, file_mtime(path)))
+}
+
 fn resolve_socket_addr(address: &str) -> anyhow::Result<SocketAddr> {
     address
         .to_socket_addrs()
@@ -1944,6 +2585,7 @@ fn resolve_lighthouses(lighthouses: &[LighthouseConfig]) -> anyhow::Result<Vec<L
             address,
             peer_id: None,
             resolved_at: Instant::now(),
+            list_requested_at: None,
         });
     }
     Ok(resolved)
@@ -2060,7 +2702,11 @@ fn packet_seq(body: &PacketBody) -> u64 {
         | PacketBody::LighthouseResponse { seq, .. }
         | PacketBody::LighthouseNotFound { seq, .. }
         | PacketBody::Keepalive { seq, .. }
-        | PacketBody::KeepaliveAck { seq, .. } => *seq,
+        | PacketBody::KeepaliveAck { seq, .. }
+        | PacketBody::PolicyAnnounce { seq, .. }
+        | PacketBody::PolicyBundle { seq, .. }
+        | PacketBody::LighthouseListQuery { seq }
+        | PacketBody::LighthouseList { seq, .. } => *seq,
     }
 }
 

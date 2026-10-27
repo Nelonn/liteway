@@ -5,4 +5,5 @@ pub mod frag;
 pub mod handshake;
 pub mod hex_serde;
 pub mod packet;
+pub mod policy;
 pub mod tunnel;

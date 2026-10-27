@@ -208,6 +208,13 @@ pub struct PeerState {
     pub next_probe: Option<Instant>,
     pub probe_interval: Duration,
     pub probe_token: Option<u64>,
+    /// Whether the policy lets data flow over this session. A lighthouse or relay
+    /// keeps a session with every member for discovery and relaying, and that
+    /// alone must not open its own address to them.
+    pub data_allowed: bool,
+    /// Last time our policy bundle was pushed to this peer; bounds how much a
+    /// peer can make us send by announcing stale versions.
+    pub policy_pushed_at: Option<Instant>,
 }
 
 impl Drop for PeerState {
@@ -466,7 +473,9 @@ pub struct HandshakeCache {
 }
 
 pub struct CachedHandshake {
-    pub response: Vec<u8>,
+    /// `None` records a refused peer: its retransmissions are dropped without
+    /// redoing the signature checks just to refuse it again.
+    pub response: Option<Vec<u8>>,
     pub peer_id: u32,
     pub created_at: Instant,
 }
@@ -482,7 +491,7 @@ impl HandshakeCache {
             .filter(|entry| now.duration_since(entry.created_at) < HANDSHAKE_CACHE_TTL)
     }
 
-    pub fn insert(&mut self, key: [u8; 32], response: Vec<u8>, peer_id: u32, now: Instant) {
+    pub fn insert(&mut self, key: [u8; 32], response: Option<Vec<u8>>, peer_id: u32, now: Instant) {
         if self.entries.len() >= HANDSHAKE_CACHE_MAX_ENTRIES {
             self.cleanup(now);
         }
@@ -506,6 +515,12 @@ impl HandshakeCache {
         );
     }
 
+    /// Forget every answer and refusal: a new policy may refuse a peer that was
+    /// answered before it arrived, or admit one that was refused.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
     pub fn cleanup(&mut self, now: Instant) {
         self.entries
             .retain(|_, entry| now.duration_since(entry.created_at) < HANDSHAKE_CACHE_TTL);
@@ -527,6 +542,8 @@ pub struct LighthouseSlot {
     /// Set once a handshake with this lighthouse completes.
     pub peer_id: Option<u32>,
     pub resolved_at: Instant,
+    /// When the peer list was last asked for over the current session.
+    pub list_requested_at: Option<Instant>,
 }
 
 /// Decide whether a freshly completed handshake should replace the session we have.
@@ -730,6 +747,8 @@ mod tests {
             next_probe: None,
             probe_interval: Duration::from_secs(5),
             probe_token: None,
+            data_allowed: true,
+            policy_pushed_at: None,
         }
     }
 
@@ -929,7 +948,7 @@ mod tests {
     fn handshake_cache_evicts_expired_entries() {
         let mut cache = HandshakeCache::new();
         let now = Instant::now();
-        cache.insert([1u8; 32], vec![0xAA], 7, now);
+        cache.insert([1u8; 32], Some(vec![0xAA]), 7, now);
         assert!(cache.get(&[1u8; 32], now).is_some());
         assert!(cache.get(&[2u8; 32], now).is_none());
 

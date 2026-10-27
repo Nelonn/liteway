@@ -47,6 +47,11 @@ pub struct AppConfig {
     pub node_key_path: String,
     pub network_secret: String,
 
+    /// Signed policy bundle (revocations and ACL). Newer bundles received from
+    /// peers are written back here so a restart does not forget a revocation.
+    #[serde(default)]
+    pub policy_path: Option<String>,
+
     #[serde(default)]
     pub lighthouses: Vec<LighthouseConfig>,
 

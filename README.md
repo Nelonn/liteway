@@ -142,6 +142,73 @@ sudo litewayd -c liteway.toml
 litewayd -c liteway.toml
 ```
 
+## 4. Revocation and access control (policy bundle)
+
+Certificates cannot be taken back once issued, so revocations and group ACLs live
+in a separate **policy bundle** signed with the CA key. Nodes verify it against
+the CA certificate they already have, which means any node may pass it on: put a
+new bundle on *one* node and it spreads to the rest of the network on its own.
+
+Write the policy by hand (`policy.toml`):
+
+```toml
+# bump on every change: a node only replaces its bundle with a higher version
+version = 2
+
+[[revoked]]
+fingerprint = "<from `liteway-cert show -c laptop1-cert.toml`>"
+comment = "laptop1 stolen"
+
+# Without any [[acl]] section the network stays open (only revocations apply).
+# With it, everything not allowed by a rule is denied; `acl = []` denies all.
+[[acl]]
+from = ["laptops"]
+to = ["servers"]
+
+[[acl]]
+from = ["admins"]
+to = ["*"]          # "*" matches every node
+```
+
+Sign and check it:
+
+```sh
+liteway-cert sign-policy -i policy.toml -o policy-bundle.toml --ca-key ca-key.toml
+liteway-cert verify-policy -p policy-bundle.toml -c ca.toml
+```
+
+Point every node at a file for it:
+
+```toml
+policy_path = "policy-bundle.toml"
+```
+
+Copy the signed bundle over that file on any node (a lighthouse is the natural
+choice). The node picks it up within `punch_interval_secs`, and every node that
+receives a newer version from a peer writes it to its own `policy_path`, so a
+restart does not forget a revocation. A missing file is fine: the node starts
+without a policy and saves the first bundle a peer gives it.
+
+What is enforced:
+
+- **Revocation.** A revoked certificate is refused in every handshake, dropped
+  from existing sessions (with a disconnect) and never returned by a lighthouse.
+  A node whose own certificate is revoked refuses to start.
+- **ACL on the receiving node.** A rule `from -> to` lets nodes in `from` open a
+  session to nodes in `to`. The node receiving a handshake checks it, and also
+  accepts a handshake from a peer it is dialling itself (the other half of a
+  hole punch). Sessions carry replies, so once open they carry traffic both ways;
+  there is no per-port filtering. Lighthouses and relays accept every member for
+  discovery and relaying, but data to their own VPN address still needs a rule.
+- **Discovery.** A lighthouse answers a lookup only if the asker may reach the
+  target, and otherwise says it does not know it. Nodes also fetch a peer list
+  from each lighthouse (logged as `lighthouse lh1 lists N reachable peer(s)`),
+  which contains only the peers the asker may open a session to.
+
+Policy and peer-list messages are new packet kinds; nodes running an older
+version drop them, so a mixed network keeps working but older nodes do not
+enforce the policy.
+
 ## How a peer-to-peer session is built
 
 1. The node asks its lighthouses which endpoint owns the destination VPN IP.
@@ -171,6 +238,8 @@ network_secret = "<hex from gen-ca>"
 ca_cert_path = "ca.toml"
 node_cert_path = "mynode-cert.toml"
 node_key_path = "mynode-key.toml"
+# signed revocation/ACL bundle; newer versions from peers are saved here
+policy_path = "policy-bundle.toml"
 am_lighthouse = false
 am_relay = false
 
@@ -212,6 +281,9 @@ Useful lines:
 | `handshake complete with <peer> (<addr>, via relay)` | the session is up but relayed |
 | `moved off the relay` | the direct path opened and the session switched to it |
 | `removing peer <name> (...): keepalive timeout` | the session went silent in both directions and will be rebuilt |
+| `adopted policy version N from ...` | a newer signed policy bundle was installed |
+| `refusing handshake from <peer> ...: certificate revoked` / `denied by ACL` | the policy keeps this peer out |
+| `lighthouse withholds (denied by ACL) <ip> ...` | a lookup was answered as unknown because the asker may not reach that peer |
 
 ## License
 

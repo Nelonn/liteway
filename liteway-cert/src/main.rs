@@ -2,6 +2,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use ipnetwork::IpNetwork;
 use liteway_core::cert::{self, CaCert, CaSigningKey, CaVerifyKey, Cert};
+use liteway_core::policy::{Policy, PolicyBody, SignedPolicy};
 use std::fs;
 use std::io::Write;
 use std::net::IpAddr;
@@ -67,6 +68,36 @@ enum Commands {
         #[arg(short, long)]
         address: String,
     },
+
+    /// Sign a policy (revocations and ACL) with the CA key
+    SignPolicy {
+        /// Unsigned policy: version, revoked certificates and ACL rules
+        #[arg(short, long)]
+        input: String,
+        #[arg(short, long, default_value = "policy-bundle.toml")]
+        out: String,
+        #[arg(long, default_value = "ca-key.toml")]
+        ca_key: String,
+    },
+
+    /// Verify a signed policy bundle against the CA and print it
+    VerifyPolicy {
+        #[arg(short, long, default_value = "policy-bundle.toml")]
+        policy: String,
+        #[arg(short, long, default_value = "ca.toml")]
+        ca_cert: String,
+    },
+}
+
+/// What an operator writes by hand; `sign-policy` stamps `issued_at` itself.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PolicySource {
+    version: u64,
+    #[serde(default)]
+    revoked: Vec<liteway_core::policy::RevokedCert>,
+    #[serde(default)]
+    acl: Option<Vec<liteway_core::policy::AclRule>>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -151,6 +182,7 @@ fn main() -> anyhow::Result<()> {
             if node_cert.verify(&ca_vk) {
                 println!("Certificate VALID");
                 println!("  Name: {}", node_cert.body.meta.name);
+                println!("  Fingerprint: {}", node_cert.fingerprint());
                 println!("  Valid until: {}", node_cert.body.meta.not_after);
                 if let Some(ref addrs) = node_cert.body.addresses {
                     println!("  IP: {}", addrs.ip);
@@ -167,6 +199,7 @@ fn main() -> anyhow::Result<()> {
                 Ok(node_cert) => {
                     println!("=== Node Certificate ===");
                     println!("  Name: {}", node_cert.body.meta.name);
+                    println!("  Fingerprint: {}", node_cert.fingerprint());
                     println!("  Groups: {:?}", node_cert.body.meta.groups);
                     println!("  CA: {}", node_cert.body.meta.is_ca);
                     println!(
@@ -207,6 +240,60 @@ fn main() -> anyhow::Result<()> {
             println!("name = \"{}\"", node_cert.body.meta.name);
             println!("address = \"{}\"", address);
         }
+
+        Commands::SignPolicy { input, out, ca_key } => {
+            let source_str = fs::read_to_string(&input)
+                .with_context(|| format!("read policy source '{input}'"))?;
+            let source: PolicySource = toml::from_str(&source_str)
+                .with_context(|| format!("parse policy source '{input}'"))?;
+            validate_policy_source(&source)?;
+
+            let ca_key_toml_str = fs::read_to_string(&ca_key)
+                .with_context(|| format!("read CA key file '{ca_key}'"))?;
+            let ca_key_file: CaKeyFile = toml::from_str(&ca_key_toml_str)?;
+
+            let signed = SignedPolicy::sign(
+                PolicyBody {
+                    version: source.version,
+                    issued_at: chrono::Utc::now(),
+                    revoked: source.revoked,
+                    acl: source.acl,
+                },
+                &ca_key_file.signing_key,
+            );
+            fs::write(&out, toml::to_string_pretty(&signed)?)
+                .with_context(|| format!("write policy bundle '{out}'"))?;
+            println!("Policy version {} written to {}", signed.body.version, out);
+            println!("Copy it to any one node's policy_path; nodes pass newer versions on to each other.");
+        }
+
+        Commands::VerifyPolicy { policy, ca_cert } => {
+            let ca_toml_str = fs::read_to_string(&ca_cert)
+                .with_context(|| format!("read CA cert file '{ca_cert}'"))?;
+            let ca: CaCert = toml::from_str(&ca_toml_str)?;
+            let signed = SignedPolicy::from_file(&policy)?;
+            let body = signed.body.clone();
+            match Policy::from_signed(signed, &ca.verify_key) {
+                Ok(verified) => {
+                    println!("Policy VALID");
+                    println!("  Version: {}", body.version);
+                    println!("  Issued: {}", body.issued_at);
+                    println!("  {}", verified.summary());
+                    for entry in &body.revoked {
+                        match &entry.comment {
+                            Some(comment) => {
+                                println!("  revoked {} ({})", entry.fingerprint, comment)
+                            }
+                            None => println!("  revoked {}", entry.fingerprint),
+                        }
+                    }
+                    for rule in body.acl.iter().flatten() {
+                        println!("  allow {:?} -> {:?}", rule.from, rule.to);
+                    }
+                }
+                Err(e) => println!("Policy INVALID: {e}"),
+            }
+        }
     }
 
     Ok(())
@@ -216,6 +303,31 @@ fn main() -> anyhow::Result<()> {
 #[serde(deny_unknown_fields)]
 struct CaKeyFile {
     signing_key: CaSigningKey,
+}
+
+/// Catch the mistakes that would otherwise only show up as a node silently
+/// failing to match: a revocation that matches nothing, or a rule that names no
+/// group at all.
+fn validate_policy_source(source: &PolicySource) -> anyhow::Result<()> {
+    if source.version == 0 {
+        anyhow::bail!("policy version must be at least 1; nodes without a bundle are at version 0");
+    }
+    for entry in &source.revoked {
+        let bytes = hex::decode(&entry.fingerprint)
+            .with_context(|| format!("revoked fingerprint '{}' is not hex", entry.fingerprint))?;
+        if bytes.len() != 32 {
+            anyhow::bail!(
+                "revoked fingerprint '{}' must be 32 bytes (64 hex characters)",
+                entry.fingerprint
+            );
+        }
+    }
+    for rule in source.acl.iter().flatten() {
+        if rule.from.is_empty() || rule.to.is_empty() {
+            anyhow::bail!("ACL rule {:?} -> {:?} matches nothing; list at least one group on each side (\"*\" matches every node)", rule.from, rule.to);
+        }
+    }
+    Ok(())
 }
 
 fn parse_node_cert(toml_str: &str) -> anyhow::Result<Cert> {

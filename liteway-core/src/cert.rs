@@ -127,6 +127,15 @@ impl CertBody {
 }
 
 impl Cert {
+    /// Stable identifier of this exact certificate, used to revoke it.
+    ///
+    /// Covers the whole signed body rather than just the key, so a node whose
+    /// certificate was re-issued with other groups or addresses can have the old
+    /// one revoked without losing the new one.
+    pub fn fingerprint(&self) -> String {
+        hex::encode(blake3::hash(&self.body.to_bytes()).as_bytes())
+    }
+
     pub fn sign(body: CertBody, ca_signing_key: &CaSigningKey) -> Self {
         let bytes = body.to_bytes();
         let ca_sk = HybridSigningKey {

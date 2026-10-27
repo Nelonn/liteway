@@ -8,6 +8,7 @@ use crate::cert::Cert;
 use crate::crypto::aead;
 use crate::crypto::kdf;
 use crate::crypto::{AEAD_TAG_LEN, K_HEADER_LEN, NONCE_LEN, SESSION_KEY_LEN};
+use crate::policy::SignedPolicy;
 
 pub const MASK_NONCE_LEN: usize = 8;
 pub const NETWORK_HEADER_LEN: usize = 16;
@@ -22,6 +23,10 @@ pub const KIND_LIGHTHOUSE_RESPONSE: u8 = 0x25;
 pub const KIND_LIGHTHOUSE_NOT_FOUND: u8 = 0x26;
 pub const KIND_KEEPALIVE: u8 = 0x27;
 pub const KIND_KEEPALIVE_ACK: u8 = 0x28;
+pub const KIND_POLICY_ANNOUNCE: u8 = 0x29;
+pub const KIND_POLICY_BUNDLE: u8 = 0x2A;
+pub const KIND_LIGHTHOUSE_LIST_QUERY: u8 = 0x2B;
+pub const KIND_LIGHTHOUSE_LIST: u8 = 0x2C;
 pub const KIND_HANDSHAKE_1: u8 = 0x11;
 pub const KIND_HANDSHAKE_2: u8 = 0x12;
 pub const KIND_HANDSHAKE_FRAG: u8 = 0x13;
@@ -41,6 +46,19 @@ pub struct NetworkHeader {
     pub frag_total: u8,
     pub dst_peer_id: u32,
     pub session_id: u32,
+}
+
+/// One node a lighthouse is willing to tell the requester about.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PeerListEntry {
+    pub peer_id: u32,
+    pub name: String,
+    pub ip: IpAddr,
+    /// Everything the peer's certificate lets it route, its own address included.
+    #[serde(default)]
+    pub routes: Vec<String>,
+    #[serde(default)]
+    pub is_relay: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,6 +100,24 @@ pub enum PacketBody {
     KeepaliveAck {
         seq: u64,
         token: u64,
+    },
+    /// The version of the policy bundle the sender holds.
+    PolicyAnnounce {
+        seq: u64,
+        version: u64,
+    },
+    PolicyBundle {
+        seq: u64,
+        /// Boxed for the same reason as the lighthouse certificate: it carries a
+        /// full ML-DSA signature.
+        policy: Box<SignedPolicy>,
+    },
+    LighthouseListQuery {
+        seq: u64,
+    },
+    LighthouseList {
+        seq: u64,
+        peers: Vec<PeerListEntry>,
     },
 }
 
@@ -288,6 +324,114 @@ pub fn encrypt_keepalive_ack_packet(
     )
 }
 
+pub fn encrypt_policy_announce_packet(
+    seq: u64,
+    dst_peer_id: u32,
+    session_id: u32,
+    version: u64,
+    network_key: &[u8; K_HEADER_LEN],
+    session_key: &[u8; SESSION_KEY_LEN],
+) -> DataPacket {
+    seal_body(
+        KIND_POLICY_ANNOUNCE,
+        seq,
+        &version.to_be_bytes(),
+        dst_peer_id,
+        session_id,
+        network_key,
+        session_key,
+    )
+}
+
+pub fn encrypt_policy_bundle_packet(
+    seq: u64,
+    dst_peer_id: u32,
+    session_id: u32,
+    policy: &SignedPolicy,
+    network_key: &[u8; K_HEADER_LEN],
+    session_key: &[u8; SESSION_KEY_LEN],
+) -> DataPacket {
+    let mut body = Vec::new();
+    put_vec_u32(&mut body, &policy.to_bytes());
+    seal_body(
+        KIND_POLICY_BUNDLE,
+        seq,
+        &body,
+        dst_peer_id,
+        session_id,
+        network_key,
+        session_key,
+    )
+}
+
+pub fn encrypt_lighthouse_list_query_packet(
+    seq: u64,
+    dst_peer_id: u32,
+    session_id: u32,
+    network_key: &[u8; K_HEADER_LEN],
+    session_key: &[u8; SESSION_KEY_LEN],
+) -> DataPacket {
+    seal_body(
+        KIND_LIGHTHOUSE_LIST_QUERY,
+        seq,
+        &[],
+        dst_peer_id,
+        session_id,
+        network_key,
+        session_key,
+    )
+}
+
+pub fn encrypt_lighthouse_list_packet(
+    seq: u64,
+    dst_peer_id: u32,
+    session_id: u32,
+    peers: &[PeerListEntry],
+    network_key: &[u8; K_HEADER_LEN],
+    session_key: &[u8; SESSION_KEY_LEN],
+) -> DataPacket {
+    let mut body = Vec::new();
+    put_vec_u32(
+        &mut body,
+        &serde_json::to_vec(peers).expect("peer list serialization failed"),
+    );
+    seal_body(
+        KIND_LIGHTHOUSE_LIST,
+        seq,
+        &body,
+        dst_peer_id,
+        session_id,
+        network_key,
+        session_key,
+    )
+}
+
+/// Frame a control message the way every packet is framed: kind, sequence
+/// number, the message itself, then padding.
+fn seal_body(
+    kind: u8,
+    seq: u64,
+    body: &[u8],
+    dst_peer_id: u32,
+    session_id: u32,
+    network_key: &[u8; K_HEADER_LEN],
+    session_key: &[u8; SESSION_KEY_LEN],
+) -> DataPacket {
+    let mut plaintext = Vec::with_capacity(1 + 8 + body.len() + 32);
+    plaintext.push(kind);
+    plaintext.extend_from_slice(&seq.to_be_bytes());
+    plaintext.extend_from_slice(body);
+    add_random_padding(&mut plaintext);
+    seal(
+        kind,
+        dst_peer_id,
+        session_id,
+        network_key,
+        session_key,
+        &plaintext,
+    )
+}
+
 pub fn decrypt_packet(
     data: &[u8],
     network_key: &[u8; K_HEADER_LEN],
@@ -358,6 +502,19 @@ pub fn decrypt_packet(
         KIND_KEEPALIVE_ACK => {
             let token = rd.u64()?;
             Some((header, PacketBody::KeepaliveAck { seq, token }))
+        }
+        KIND_POLICY_ANNOUNCE => {
+            let version = rd.u64()?;
+            Some((header, PacketBody::PolicyAnnounce { seq, version }))
+        }
+        KIND_POLICY_BUNDLE => {
+            let policy = Box::new(SignedPolicy::from_bytes(rd.vec_u32()?).ok()?);
+            Some((header, PacketBody::PolicyBundle { seq, policy }))
+        }
+        KIND_LIGHTHOUSE_LIST_QUERY => Some((header, PacketBody::LighthouseListQuery { seq })),
+        KIND_LIGHTHOUSE_LIST => {
+            let peers = serde_json::from_slice(rd.vec_u32()?).ok()?;
+            Some((header, PacketBody::LighthouseList { seq, peers }))
         }
         _ => None,
     }
@@ -505,6 +662,10 @@ fn decode_header(bytes: [u8; NETWORK_HEADER_LEN]) -> Option<NetworkHeader> {
         | KIND_LIGHTHOUSE_NOT_FOUND
         | KIND_KEEPALIVE
         | KIND_KEEPALIVE_ACK
+        | KIND_POLICY_ANNOUNCE
+        | KIND_POLICY_BUNDLE
+        | KIND_LIGHTHOUSE_LIST_QUERY
+        | KIND_LIGHTHOUSE_LIST
         | KIND_HANDSHAKE_1
         | KIND_HANDSHAKE_2
         | KIND_HANDSHAKE_FRAG => {}
